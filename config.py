@@ -23,8 +23,23 @@ TRAFFIC_SOURCES = ['VK', 'INST', 'TG', 'YTB', 'QR', 'OTHER', 'REFERRAL']
 # User Roles
 USER_ROLES = {
     'designer': 'Дизайнер',
-    'builder': 'Строитель',
-    'realtor': 'Риелтор',
-    'partner': 'Партнер',
-    'other': 'Другое'
+    'partner': 'Партнер'
+}
+
+# Deal Funnels and Stages
+DESIGNER_FUNNEL_STAGES = {
+    'NEW': 'Новая сделка (новый номер)',
+    'PROJECT_RECEIVED': 'Получен проект на просчет',
+    'ESTIMATE_DONE': 'Просчет сделан',
+    'MEASUREMENT': 'Замер',
+    'WON': 'Успешно реализовано',
+    'LOSE': 'Не реализовано'
+}
+
+PARTNER_FUNNEL_STAGES = {
+    'PROJECT_RECEIVED': 'Получен проект на просчет',
+    'ESTIMATE_DONE': 'Просчет сделан',
+    'MEASUREMENT': 'Замер',
+    'WON': 'Успешно реализовано',
+    'LOSE': 'Не реализовано'
 }

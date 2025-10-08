@@ -74,7 +74,7 @@ class Database:
     async def update_user(self, telegram_id: int, **kwargs):
         """Update user information"""
         fields = ', '.join([f"{key} = ?" for key in kwargs.keys()])
-        values = list(kwargs.values()) + [telegram_id]
+        values = list(kwargs.values())
 
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(

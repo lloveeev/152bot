@@ -1,27 +1,64 @@
 import aiohttp
 from typing import Optional, Dict, List
 import config
+import logging
+import json
+import re
+
+logger = logging.getLogger(__name__)
+
+
+def normalize_phone(phone: str) -> str:
+    """
+    Normalize phone number to last 10 digits (without +7/8)
+    Example: +79161234567 -> 9161234567
+    """
+    if not phone:
+        return ""
+
+    # Remove all non-digit characters
+    digits = re.sub(r'\D', '', phone)
+
+    # Take last 10 digits
+    normalized = digits[-10:] if len(digits) >= 10 else digits
+
+    logger.debug(f"[normalize_phone] {phone} -> {normalized}")
+    return normalized
 
 
 class BitrixAPI:
     def __init__(self, webhook_url: str = config.BITRIX_WEBHOOK_URL):
         self.webhook_url = webhook_url.rstrip('/')
+        logger.info(f"[BitrixAPI] Инициализация с webhook URL: {self.webhook_url[:50]}...")
 
     async def _make_request(self, method: str, params: Dict = None) -> Dict:
         """Make request to Bitrix24 API"""
         url = f"{self.webhook_url}/{method}"
+        logger.info(f"[BitrixAPI] Запрос к Bitrix24: {method}")
+        logger.debug(f"[BitrixAPI] URL: {url}")
+        logger.debug(f"[BitrixAPI] Параметры: {json.dumps(params, ensure_ascii=False, indent=2)}")
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=params or {}) as response:
+                    response_text = await response.text()
+                    logger.info(f"[BitrixAPI] Статус ответа: {response.status}")
+                    logger.debug(f"[BitrixAPI] Тело ответа: {response_text}")
+
                     if response.status == 200:
-                        return await response.json()
+                        result = await response.json()
+                        logger.info(f"[BitrixAPI] ✅ Запрос {method} успешен")
+                        return result
                     else:
-                        return {"error": f"HTTP {response.status}"}
+                        logger.error(f"[BitrixAPI] ❌ Ошибка HTTP {response.status}: {response_text}")
+                        return {"error": f"HTTP {response.status}", "details": response_text}
         except Exception as e:
+            logger.exception(f"[BitrixAPI] ❌ Исключение при запросе {method}: {str(e)}")
             return {"error": str(e)}
 
     async def find_contact_by_name(self, full_name: str) -> Optional[Dict]:
         """Find contact in Bitrix24 by full name"""
+        logger.info(f"[find_contact_by_name] Поиск контакта по имени: {full_name}")
         params = {
             "filter": {"NAME": full_name},
             "select": ["ID", "NAME", "LAST_NAME", "SECOND_NAME", "PHONE", "EMAIL", "COMPANY_TITLE"]
@@ -29,30 +66,42 @@ class BitrixAPI:
         result = await self._make_request("crm.contact.list", params)
 
         if result.get("result") and len(result["result"]) > 0:
+            logger.info(f"[find_contact_by_name] ✅ Найден контакт ID: {result['result'][0].get('ID')}")
+            logger.debug(f"[find_contact_by_name] Данные: {json.dumps(result['result'][0], ensure_ascii=False)}")
             return result["result"][0]
+        logger.warning(f"[find_contact_by_name] ⚠️ Контакт не найден")
         return None
 
     async def find_contact_by_phone(self, phone: str) -> Optional[Dict]:
-        """Find contact in Bitrix24 by phone number"""
+        """Find contact in Bitrix24 by phone number (normalized to 10 digits)"""
+        normalized_phone = normalize_phone(phone)
+        logger.info(f"[find_contact_by_phone] Поиск контакта по телефону: {phone} (нормализован: {normalized_phone})")
         params = {
-            "filter": {"PHONE": phone},
+            "filter": {"PHONE": normalized_phone},
             "select": ["ID", "NAME", "LAST_NAME", "SECOND_NAME", "PHONE", "EMAIL", "COMPANY_TITLE"]
         }
         result = await self._make_request("crm.contact.list", params)
 
         if result.get("result") and len(result["result"]) > 0:
+            logger.info(f"[find_contact_by_phone] ✅ Найден контакт ID: {result['result'][0].get('ID')}")
+            logger.debug(f"[find_contact_by_phone] Данные: {json.dumps(result['result'][0], ensure_ascii=False)}")
             return result["result"][0]
+        logger.warning(f"[find_contact_by_phone] ⚠️ Контакт не найден")
         return None
 
     async def create_contact(self, contact_data: Dict) -> Optional[int]:
         """Create new contact in Bitrix24"""
+        logger.info(f"[create_contact] Создание нового контакта")
+        logger.debug(f"[create_contact] Данные контакта: {json.dumps(contact_data, ensure_ascii=False)}")
+
         params = {
             "fields": {
                 "NAME": contact_data.get("first_name", ""),
                 "LAST_NAME": contact_data.get("last_name", ""),
                 "SECOND_NAME": contact_data.get("middle_name", ""),
-                "PHONE": [{"VALUE": contact_data.get("phone"), "VALUE_TYPE": "WORK"}],
-                "EMAIL": [{"VALUE": contact_data.get("email"), "VALUE_TYPE": "WORK"}],
+                "POST": contact_data.get("position", "Дизайнер"),
+                "PHONE": [{"VALUE": contact_data.get("phone"), "VALUE_TYPE": "WORK"}] if contact_data.get("phone") else [],
+                "EMAIL": [{"VALUE": contact_data.get("email"), "VALUE_TYPE": "WORK"}] if contact_data.get("email") else [],
                 "COMPANY_TITLE": contact_data.get("company_name", ""),
                 "UF_CRM_TELEGRAM_ID": contact_data.get("telegram_id")
             }
@@ -60,75 +109,84 @@ class BitrixAPI:
         result = await self._make_request("crm.contact.add", params)
 
         if result.get("result"):
+            logger.info(f"[create_contact] ✅ Контакт создан с ID: {result['result']}")
             return result["result"]
+        logger.error(f"[create_contact] ❌ Не удалось создать контакт: {result}")
         return None
 
     async def update_contact(self, contact_id: int, contact_data: Dict) -> bool:
         """Update existing contact in Bitrix24"""
+        logger.info(f"[update_contact] Обновление контакта ID: {contact_id}")
+        logger.debug(f"[update_contact] Новые данные: {json.dumps(contact_data, ensure_ascii=False)}")
+
         params = {
             "id": contact_id,
             "fields": contact_data
         }
         result = await self._make_request("crm.contact.update", params)
-        return result.get("result", False)
-
-    async def create_deal(self, deal_data: Dict) -> Optional[Dict]:
-        """Create new deal in Bitrix24"""
-        # First, find or create client contact
-        client_contact_id = None
-
-        # Try to find existing client by phone
-        client = await self.find_contact_by_phone(deal_data.get("client_phone"))
-        if client:
-            client_contact_id = client.get("ID")
-        else:
-            # Create new client contact
-            name_parts = deal_data.get("client_full_name", "").split()
-            client_data = {
-                "last_name": name_parts[0] if len(name_parts) > 0 else "",
-                "first_name": name_parts[1] if len(name_parts) > 1 else "",
-                "middle_name": name_parts[2] if len(name_parts) > 2 else "",
-                "phone": deal_data.get("client_phone")
-            }
-            client_contact_id = await self.create_contact(client_data)
-
-        # Create deal
-        params = {
-            "fields": {
-                "TITLE": f"Заявка от дизайнера: {deal_data.get('designer_name')}",
-                "CONTACT_ID": client_contact_id,
-                "COMMENTS": deal_data.get("comment", ""),
-                "UF_CRM_DESIGNER_ID": deal_data.get("designer_bitrix_id"),
-                "UF_CRM_PROJECT_FILE": deal_data.get("project_file_url", "")
-            }
-        }
-
-        result = await self._make_request("crm.deal.add", params)
 
         if result.get("result"):
-            deal_id = result["result"]
-            # Get deal details to retrieve deal number
-            deal_info = await self.get_deal(deal_id)
-            return {
-                "id": deal_id,
-                "number": deal_info.get("ID", str(deal_id)),
-                "status": deal_info.get("STAGE_ID", "NEW")
+            logger.info(f"[update_contact] ✅ Контакт {contact_id} обновлен")
+        else:
+            logger.error(f"[update_contact] ❌ Не удалось обновить контакт: {result}")
+        return result.get("result", False)
+
+    async def create_lead(self, lead_data: Dict) -> Optional[Dict]:
+        """Create new lead in Bitrix24 (will be converted to deal by manager)"""
+        logger.info(f"[create_lead] Создание нового лида")
+        logger.debug(f"[create_lead] Входные данные: {json.dumps(lead_data, ensure_ascii=False)}")
+
+        # Parse client name
+        name_parts = lead_data.get("client_full_name", "").split()
+
+        # Create lead
+        params = {
+            "fields": {
+                "TITLE": f"Заявка от {lead_data.get('designer_role', 'дизайнера')}: {lead_data.get('designer_name')}",
+                "NAME": name_parts[1] if len(name_parts) > 1 else "",
+                "LAST_NAME": name_parts[0] if len(name_parts) > 0 else "",
+                "SECOND_NAME": name_parts[2] if len(name_parts) > 2 else "",
+                "PHONE": [{"VALUE": normalize_phone(lead_data.get("client_phone")), "VALUE_TYPE": "WORK"}],
+                "COMMENTS": lead_data.get("comment", ""),
+                "SOURCE_ID": "TELEGRAM",
+                "UF_CRM_DESIGNER_ID": lead_data.get("designer_bitrix_id"),
+                "UF_CRM_PROJECT_FILE": lead_data.get("project_file_url", "")
             }
+        }
+        logger.debug(f"[create_lead] Параметры лида: {json.dumps(params, ensure_ascii=False)}")
+
+        result = await self._make_request("crm.lead.add", params)
+
+        if result.get("result"):
+            lead_id = result["result"]
+            logger.info(f"[create_lead] ✅ Лид создан с ID: {lead_id}")
+            lead_result = {
+                "id": lead_id,
+                "number": str(lead_id)
+            }
+            logger.info(f"[create_lead] Результат: {json.dumps(lead_result, ensure_ascii=False)}")
+            return lead_result
+        logger.error(f"[create_lead] ❌ Не удалось создать лид: {result}")
         return None
 
     async def get_deal(self, deal_id: int) -> Optional[Dict]:
         """Get deal information by ID"""
+        logger.info(f"[get_deal] Получение информации о сделке ID: {deal_id}")
         params = {
             "id": deal_id
         }
         result = await self._make_request("crm.deal.get", params)
 
         if result.get("result"):
+            logger.info(f"[get_deal] ✅ Информация о сделке получена")
+            logger.debug(f"[get_deal] Данные сделки: {json.dumps(result['result'], ensure_ascii=False)}")
             return result["result"]
+        logger.error(f"[get_deal] ❌ Не удалось получить сделку: {result}")
         return None
 
     async def get_deals_by_designer(self, designer_bitrix_id: int) -> List[Dict]:
         """Get all deals for a specific designer"""
+        logger.info(f"[get_deals_by_designer] Получение сделок дизайнера ID: {designer_bitrix_id}")
         params = {
             "filter": {"UF_CRM_DESIGNER_ID": designer_bitrix_id},
             "select": ["ID", "TITLE", "STAGE_ID", "DATE_CREATE", "OPPORTUNITY", "CURRENCY_ID"]
@@ -136,14 +194,21 @@ class BitrixAPI:
         result = await self._make_request("crm.deal.list", params)
 
         if result.get("result"):
+            logger.info(f"[get_deals_by_designer] ✅ Найдено сделок: {len(result['result'])}")
+            logger.debug(f"[get_deals_by_designer] Сделки: {json.dumps(result['result'], ensure_ascii=False)}")
             return result["result"]
+        logger.warning(f"[get_deals_by_designer] ⚠️ Сделки не найдены")
         return []
 
     async def get_deal_status(self, deal_id: int) -> Optional[str]:
         """Get current deal status"""
+        logger.info(f"[get_deal_status] Получение статуса сделки ID: {deal_id}")
         deal = await self.get_deal(deal_id)
         if deal:
-            return deal.get("STAGE_ID")
+            status = deal.get("STAGE_ID")
+            logger.info(f"[get_deal_status] ✅ Статус сделки: {status}")
+            return status
+        logger.warning(f"[get_deal_status] ⚠️ Не удалось получить статус сделки")
         return None
 
     async def get_stage_name(self, stage_id: str) -> str:
