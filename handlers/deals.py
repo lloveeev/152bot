@@ -3,7 +3,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
 from database import Database
-from bitrix_api import BitrixAPI
+from bitrix_api import BitrixAPI, validate_phone
 from states import DealCreationStates, DealStatusStates
 from keyboards import get_designer_menu_keyboard, get_cancel_keyboard, get_confirmation_keyboard
 import config
@@ -60,8 +60,15 @@ async def client_phone_entered(message: Message, state: FSMContext):
 
     client_phone = message.text.strip()
 
-    if len(client_phone) < 10:
-        await message.answer("Пожалуйста, введите корректный номер телефона:")
+    if not validate_phone(client_phone):
+        await message.answer(
+            "❌ Неверный формат номера телефона.\n\n"
+            "Пожалуйста, введите номер в правильном формате:\n"
+            "• +79161234567\n"
+            "• 89161234567\n"
+            "• 79161234567\n"
+            "• 9161234567"
+        )
         return
 
     await state.update_data(client_phone=client_phone)
@@ -146,7 +153,7 @@ async def deal_confirmed(callback: CallbackQuery, state: FSMContext):
         "comment": data.get('comment')
     }
 
-    bitrix_deal = await bitrix.create_deal(deal_data)
+    bitrix_deal = await bitrix.create_lead(deal_data)
 
     if bitrix_deal:
         await db.add_deal({
@@ -264,7 +271,7 @@ async def deal_number_entered(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    current_status = await bitrix.get_deal_status(deal.get('bitrix_deal_id'))
+    current_status = await bitrix.get_lead_status(deal.get('bitrix_deal_id'))
 
     if current_status:
         # Update local database

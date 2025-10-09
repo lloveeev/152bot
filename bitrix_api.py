@@ -8,6 +8,37 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def validate_phone(phone: str) -> bool:
+    """
+    Validate phone number format
+    Accepts Russian phone numbers in various formats:
+    - +79161234567 (11 digits with +7)
+    - 89161234567 (11 digits with 8)
+    - 79161234567 (11 digits with 7)
+    - 9161234567 (10 digits)
+    Returns True if valid, False otherwise
+    """
+    if not phone:
+        return False
+
+    # Remove all non-digit characters
+    digits = re.sub(r'\D', '', phone)
+
+    # Valid phone should have 10-11 digits
+    if len(digits) < 10 or len(digits) > 11:
+        return False
+
+    # If 11 digits, first digit should be 7 or 8
+    if len(digits) == 11 and digits[0] not in ['7', '8']:
+        return False
+
+    # If 10 digits, first digit should be 9 (mobile) or 3-9 (landline)
+    if len(digits) == 10 and not digits[0].isdigit():
+        return False
+
+    return True
+
+
 def normalize_phone(phone: str) -> str:
     """
     Normalize phone number to last 10 digits (without +7/8)
@@ -162,11 +193,27 @@ class BitrixAPI:
             logger.info(f"[create_lead] ✅ Лид создан с ID: {lead_id}")
             lead_result = {
                 "id": lead_id,
-                "number": str(lead_id)
+                "number": str(lead_id),
+                "status": "NEW"  # Default status for new leads
             }
             logger.info(f"[create_lead] Результат: {json.dumps(lead_result, ensure_ascii=False)}")
             return lead_result
         logger.error(f"[create_lead] ❌ Не удалось создать лид: {result}")
+        return None
+
+    async def get_lead(self, lead_id: int) -> Optional[Dict]:
+        """Get lead information by ID"""
+        logger.info(f"[get_lead] Получение информации о лиде ID: {lead_id}")
+        params = {
+            "id": lead_id
+        }
+        result = await self._make_request("crm.lead.get", params)
+
+        if result.get("result"):
+            logger.info(f"[get_lead] ✅ Информация о лиде получена")
+            logger.debug(f"[get_lead] Данные лида: {json.dumps(result['result'], ensure_ascii=False)}")
+            return result["result"]
+        logger.error(f"[get_lead] ❌ Не удалось получить лид: {result}")
         return None
 
     async def get_deal(self, deal_id: int) -> Optional[Dict]:
@@ -200,6 +247,17 @@ class BitrixAPI:
         logger.warning(f"[get_deals_by_designer] ⚠️ Сделки не найдены")
         return []
 
+    async def get_lead_status(self, lead_id: int) -> Optional[str]:
+        """Get current lead status"""
+        logger.info(f"[get_lead_status] Получение статуса лида ID: {lead_id}")
+        lead = await self.get_lead(lead_id)
+        if lead:
+            status = lead.get("STATUS_ID")
+            logger.info(f"[get_lead_status] ✅ Статус лида: {status}")
+            return status
+        logger.warning(f"[get_lead_status] ⚠️ Не удалось получить статус лида")
+        return None
+
     async def get_deal_status(self, deal_id: int) -> Optional[str]:
         """Get current deal status"""
         logger.info(f"[get_deal_status] Получение статуса сделки ID: {deal_id}")
@@ -212,9 +270,20 @@ class BitrixAPI:
         return None
 
     async def get_stage_name(self, stage_id: str) -> str:
-        """Get human-readable stage name"""
+        """Get human-readable stage name for both leads and deals"""
         # This is a simplified mapping. In production, you should fetch this from Bitrix24
-        stage_mapping = {
+
+        # Lead statuses (STATUS_ID)
+        lead_mapping = {
+            "NEW": "Новый лид",
+            "IN_PROCESS": "В обработке",
+            "PROCESSED": "Обработан",
+            "JUNK": "Некачественный лид",
+            "CONVERTED": "Конвертирован в сделку"
+        }
+
+        # Deal stages (STAGE_ID)
+        deal_mapping = {
             "NEW": "Новая заявка",
             "PREPARATION": "Подготовка",
             "PREPAYMENT_INVOICE": "Выставлен счет на предоплату",
@@ -223,5 +292,7 @@ class BitrixAPI:
             "WON": "Успешно реализовано",
             "LOSE": "Закрыто и не реализовано"
         }
-        return stage_mapping.get(stage_id, stage_id)
+
+        # Try lead mapping first, then deal mapping
+        return lead_mapping.get(stage_id) or deal_mapping.get(stage_id, stage_id)
 

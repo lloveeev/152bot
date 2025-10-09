@@ -6,7 +6,7 @@ from aiogram.fsm.context import FSMContext
 import json
 
 from database import Database
-from bitrix_api import BitrixAPI
+from bitrix_api import BitrixAPI, validate_phone
 from states import RegistrationStates
 from keyboards import (
     get_privacy_consent_keyboard,
@@ -202,6 +202,38 @@ async def company_entered(message: Message, state: FSMContext):
 async def phone_shared(message: Message, state: FSMContext):
     """Handle phone number shared via button"""
     phone = message.contact.phone_number
+    await state.update_data(phone=phone)
+
+    await message.answer(
+        "Спасибо! Теперь введите ваш email:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(RegistrationStates.waiting_for_email)
+
+
+@router.message(RegistrationStates.waiting_for_phone)
+async def phone_entered(message: Message, state: FSMContext):
+    """Handle phone number entered manually"""
+    if message.text == "❌ Отмена":
+        await message.answer("Регистрация отменена. Напишите /start для начала.")
+        await state.clear()
+        return
+
+    phone = message.text.strip()
+
+    if not validate_phone(phone):
+        await message.answer(
+            "❌ Неверный формат номера телефона.\n\n"
+            "Пожалуйста, введите номер в правильном формате:\n"
+            "• +79161234567\n"
+            "• 89161234567\n"
+            "• 79161234567\n"
+            "• 9161234567\n\n"
+            "Или используйте кнопку 'Поделиться номером'",
+            reply_markup=get_phone_request_keyboard()
+        )
+        return
+
     await state.update_data(phone=phone)
 
     await message.answer(
