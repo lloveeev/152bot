@@ -1,6 +1,7 @@
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
+from typing import Dict
 
 from database import Database
 from bitrix_api import BitrixAPI, validate_phone
@@ -194,9 +195,35 @@ async def deal_cancelled(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def sync_deal_with_bitrix(deal: Dict) -> Dict:
+    """
+    Sync single deal with Bitrix24 and validate it
+    Returns updated deal with sync status
+    """
+    deal_id = deal.get('bitrix_deal_id')
+    deal_number = deal.get('deal_number')
+
+    # Try to get current status from Bitrix
+    current_status = await bitrix.get_lead_status(deal_id)
+
+    if current_status:
+        # Deal exists in Bitrix - update if status changed
+        if current_status != deal.get('status'):
+            await db.update_deal_status(deal_number, current_status)
+            deal['status'] = current_status
+            deal['sync_status'] = 'updated'
+        else:
+            deal['sync_status'] = 'valid'
+    else:
+        # Deal not found in Bitrix - mark as invalid
+        deal['sync_status'] = 'not_found'
+
+    return deal
+
+
 @router.message(F.text == "📋 Мои сделки")
 async def my_deals(message: Message):
-    """Show user's deals"""
+    """Show user's deals with Bitrix validation"""
     user = await db.get_user(message.from_user.id)
 
     if not user or user.get('role') != 'designer':
@@ -213,19 +240,97 @@ async def my_deals(message: Message):
         )
         return
 
-    deals_text = "📋 Ваши сделки:\n\n"
+    # Show loading message
+    loading_msg = await message.answer("🔄 Синхронизация с Битрикс24...")
 
+    # Sync all deals with Bitrix
+    synced_deals = []
     for deal in deals:
-        status_name = await bitrix.get_stage_name(deal.get('status', 'NEW'))
-        deals_text += (
-            f"📌 Сделка #{deal.get('deal_number')}\n"
-            f"👤 Клиент: {deal.get('client_full_name')}\n"
-            f"📊 Статус: {status_name}\n"
-            f"📅 Дата: {deal.get('created_date', '')[:10]}\n"
-            f"{'─' * 30}\n\n"
+        synced_deal = await sync_deal_with_bitrix(deal)
+        synced_deals.append(synced_deal)
+
+    # Separate valid and invalid deals
+    valid_deals = []
+    invalid_deals = []
+
+    for deal in synced_deals:
+        if deal.get('sync_status') == 'not_found':
+            invalid_deals.append(deal)
+        else:
+            valid_deals.append(deal)
+
+    # If there are invalid deals, show them and delete from DB
+    if invalid_deals:
+        invalid_text = "⚠️ Следующие сделки не найдены в Битрикс24 и будут удалены из списка:\n\n"
+
+        for deal in invalid_deals:
+            invalid_text += (
+                f"📌 Сделка #{deal.get('deal_number')}\n"
+                f"👤 Клиент: {deal.get('client_full_name')}\n"
+                f"📅 Дата создания: {deal.get('created_date', '')[:10]}\n"
+                f"{'─' * 30}\n\n"
+            )
+
+        invalid_text += (
+            f"⚠️ Удалено сделок: {len(invalid_deals)}\n"
+            f"Если это ошибка, обратитесь к менеджеру: @{config.MANAGER_USERNAME}"
         )
 
-    await message.answer(deals_text, reply_markup=get_designer_menu_keyboard())
+        # Delete invalid deals from database
+        for deal in invalid_deals:
+            await db.delete_deal(deal.get('deal_number'))
+
+        # Show invalid deals message
+        await loading_msg.delete()
+        await message.answer(invalid_text)
+
+    # Show valid deals if any
+    if valid_deals:
+        deals_text = "📋 Ваши активные сделки:\n\n"
+
+        for deal in valid_deals:
+            sync_status = deal.get('sync_status')
+            status_name = await bitrix.get_stage_name(deal.get('status', 'NEW'))
+            status_icon = "🆕" if sync_status == 'updated' else "📊"
+
+            deals_text += (
+                f"📌 Сделка #{deal.get('deal_number')}\n"
+                f"👤 Клиент: {deal.get('client_full_name')}\n"
+                f"{status_icon} Статус: {status_name}"
+            )
+
+            if sync_status == 'updated':
+                deals_text += " (обновлено)\n"
+            else:
+                deals_text += "\n"
+
+            deals_text += (
+                f"📅 Дата: {deal.get('created_date', '')[:10]}\n"
+                f"{'─' * 30}\n\n"
+            )
+
+        if invalid_deals:
+            # Loading message already deleted, just send deals
+            await message.answer(deals_text, reply_markup=get_designer_menu_keyboard())
+        else:
+            # Delete loading message and send deals
+            await loading_msg.delete()
+            await message.answer(deals_text, reply_markup=get_designer_menu_keyboard())
+    elif not invalid_deals:
+        # No deals at all (shouldn't happen as we check earlier, but just in case)
+        await loading_msg.delete()
+        await message.answer(
+            "У вас пока нет активных сделок.\n\n"
+            "Создайте новую сделку через меню 'Новая сделка'!",
+            reply_markup=get_designer_menu_keyboard()
+        )
+    else:
+        # All deals were invalid and deleted
+        await message.answer(
+            "Все сделки были удалены из списка.\n\n"
+            "Создайте новую сделку через меню 'Новая сделка'!",
+            reply_markup=get_designer_menu_keyboard()
+        )
 
 
 @router.message(F.text == "🔍 Узнать статус")

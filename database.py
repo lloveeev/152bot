@@ -187,6 +187,15 @@ class Database:
             )
             await db.commit()
 
+    async def delete_deal(self, deal_number: str):
+        """Delete deal from database"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "DELETE FROM deals WHERE deal_number = ?",
+                (deal_number,)
+            )
+            await db.commit()
+
     # State management
     async def set_state(self, telegram_id: int, state: str, data: str = None):
         """Set user state for FSM"""
