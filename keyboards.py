@@ -1,4 +1,5 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+
 from config import USER_ROLES
 
 
@@ -51,6 +52,25 @@ def get_admin_menu_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True
     )
+
+
+def get_partner_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Main menu keyboard for partner"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📝 Новая сделка")],
+            [KeyboardButton(text="📋 Мои сделки"), KeyboardButton(text="🔍 Узнать статус")],
+            [KeyboardButton(text="🤝 Партнерская программа")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def get_main_menu_keyboard(role: str) -> ReplyKeyboardMarkup:
+    """Return main menu keyboard based on user role."""
+    if role == 'partner':
+        return get_partner_menu_keyboard()
+    return get_designer_menu_keyboard()
 
 
 def get_broadcast_role_keyboard() -> InlineKeyboardMarkup:

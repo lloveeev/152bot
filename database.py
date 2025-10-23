@@ -11,6 +11,15 @@ class Database:
     async def init_db(self):
         """Initialize database with required tables"""
         async with aiosqlite.connect(self.db_path) as db:
+            async def _column_exists(table: str, column: str) -> bool:
+                async with db.execute(f"PRAGMA table_info({table})") as cursor:
+                    rows = await cursor.fetchall()
+                return any(row[1] == column for row in rows)
+
+            async def _ensure_column(table: str, column: str, definition: str):
+                if not await _column_exists(table, column):
+                    await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
             # Users table
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS users (
@@ -40,12 +49,20 @@ class Database:
                     client_full_name TEXT,
                     client_phone TEXT,
                     project_file_id TEXT,
+                    project_file_name TEXT,
                     comment TEXT,
                     status TEXT,
+                    entity_type TEXT DEFAULT 'lead',
+                    owner_role TEXT,
                     created_date TEXT,
                     FOREIGN KEY (designer_telegram_id) REFERENCES users(telegram_id)
                 )
             ''')
+
+            # Backwards compatibility for additional columns
+            await _ensure_column('deals', 'project_file_name', 'TEXT')
+            await _ensure_column('deals', 'entity_type', "TEXT DEFAULT 'lead'")
+            await _ensure_column('deals', 'owner_role', 'TEXT')
 
             # User states table for FSM
             await db.execute('''
@@ -140,8 +157,9 @@ class Database:
             await db.execute(
                 '''INSERT INTO deals
                    (deal_number, bitrix_deal_id, designer_telegram_id, client_full_name,
-                    client_phone, project_file_id, comment, status, created_date)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    client_phone, project_file_id, project_file_name, comment, status,
+                    entity_type, owner_role, created_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (
                     deal_data.get('deal_number'),
                     deal_data.get('bitrix_deal_id'),
@@ -149,8 +167,11 @@ class Database:
                     deal_data.get('client_full_name'),
                     deal_data.get('client_phone'),
                     deal_data.get('project_file_id'),
+                    deal_data.get('project_file_name'),
                     deal_data.get('comment'),
                     deal_data.get('status'),
+                    deal_data.get('entity_type', 'lead'),
+                    deal_data.get('owner_role'),
                     datetime.now().isoformat()
                 )
             )

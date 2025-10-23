@@ -57,6 +57,16 @@ def normalize_phone(phone: str) -> str:
     return normalized
 
 
+def _normalize_stage_id(stage_id: str) -> str:
+    """Return stage ID without pipeline prefixes (e.g. C1:, L1:) and in upper-case."""
+    if not stage_id:
+        return stage_id
+    normalized = stage_id
+    if ':' in normalized:
+        normalized = normalized.split(':', 1)[1]
+    return normalized.upper()
+
+
 class BitrixAPI:
     def __init__(self, webhook_url: str = config.BITRIX_WEBHOOK_URL):
         self.webhook_url = webhook_url.rstrip('/')
@@ -170,20 +180,44 @@ class BitrixAPI:
         # Parse client name
         name_parts = lead_data.get("client_full_name", "").split()
 
-        # Create lead
-        params = {
-            "fields": {
-                "TITLE": f"Заявка от {lead_data.get('designer_role', 'дизайнера')}: {lead_data.get('designer_name')}",
-                "NAME": name_parts[1] if len(name_parts) > 1 else "",
-                "LAST_NAME": name_parts[0] if len(name_parts) > 0 else "",
-                "SECOND_NAME": name_parts[2] if len(name_parts) > 2 else "",
-                "PHONE": [{"VALUE": normalize_phone(lead_data.get("client_phone")), "VALUE_TYPE": "WORK"}],
-                "COMMENTS": lead_data.get("comment", ""),
-                "SOURCE_ID": "TELEGRAM",
-                "UF_CRM_DESIGNER_ID": lead_data.get("designer_bitrix_id"),
-                "UF_CRM_PROJECT_FILE": lead_data.get("project_file_url", "")
-            }
+        role_key = lead_data.get("designer_role_key", "designer")
+        role_title = lead_data.get("designer_role_title") or config.USER_ROLES.get(role_key, "Дизайнер")
+        designer_name = lead_data.get("designer_name", "Не указан")
+        crm_agent_name = lead_data.get("crm_agent_name")
+        project_file_url = lead_data.get("project_file_url")
+        project_file_name = lead_data.get("project_file_name")
+        normalized_phone = normalize_phone(lead_data.get("client_phone"))
+
+        fields = {
+            "TITLE": f"Заявка от {role_title}: {designer_name}",
+            "NAME": name_parts[1] if len(name_parts) > 1 else "",
+            "LAST_NAME": name_parts[0] if len(name_parts) > 0 else "",
+            "SECOND_NAME": name_parts[2] if len(name_parts) > 2 else "",
+            "POST": role_title,
+            "COMMENTS": lead_data.get("comment", ""),
+            "SOURCE_ID": config.BITRIX_LEAD_SOURCE_ID,
+            "SOURCE_DESCRIPTION": config.BITRIX_SOURCE_DESCRIPTION,
         }
+
+        if normalized_phone:
+            fields["PHONE"] = [{"VALUE": normalized_phone, "VALUE_TYPE": "WORK"}]
+
+        if lead_data.get("designer_bitrix_id"):
+            fields["UF_CRM_DESIGNER_ID"] = lead_data.get("designer_bitrix_id")
+
+        if project_file_url:
+            fields[config.BITRIX_PROJECT_FILE_FIELD] = project_file_url
+
+        if project_file_name:
+            fields[config.BITRIX_PROJECT_FILE_NAME_FIELD] = project_file_name
+
+        if crm_agent_name:
+            fields[config.BITRIX_CRM_AGENT_FIELD] = crm_agent_name
+
+        if config.BITRIX_RESPONSIBLE_ID:
+            fields["ASSIGNED_BY_ID"] = config.BITRIX_RESPONSIBLE_ID
+
+        params = {"fields": fields}
         logger.debug(f"[create_lead] Параметры лида: {json.dumps(params, ensure_ascii=False)}")
 
         result = await self._make_request("crm.lead.add", params)
@@ -194,11 +228,70 @@ class BitrixAPI:
             lead_result = {
                 "id": lead_id,
                 "number": str(lead_id),
-                "status": "NEW"  # Default status for new leads
+                "status": "NEW",  # Default status for new leads
+                "entity_type": "lead"
             }
             logger.info(f"[create_lead] Результат: {json.dumps(lead_result, ensure_ascii=False)}")
             return lead_result
         logger.error(f"[create_lead] ❌ Не удалось создать лид: {result}")
+        return None
+
+    async def create_partner_deal(self, deal_data: Dict) -> Optional[Dict]:
+        """Create new deal in partner pipeline"""
+        logger.info(f"[create_partner_deal] Создание новой сделки партнера")
+        logger.debug(f"[create_partner_deal] Входные данные: {json.dumps(deal_data, ensure_ascii=False)}")
+
+        stage_id = deal_data.get("stage_id") or config.BITRIX_PARTNER_INITIAL_STAGE
+        category_id = config.BITRIX_PARTNER_CATEGORY_ID
+        crm_agent_name = deal_data.get("crm_agent_name")
+        project_file_url = deal_data.get("project_file_url")
+        project_file_name = deal_data.get("project_file_name")
+
+        fields = {
+            "TITLE": f"Сделка от партнера: {deal_data.get('designer_name', 'Не указан')}",
+            "STAGE_ID": stage_id,
+            "COMMENTS": deal_data.get("comment", ""),
+            "SOURCE_ID": config.BITRIX_LEAD_SOURCE_ID,
+            "SOURCE_DESCRIPTION": config.BITRIX_SOURCE_DESCRIPTION,
+        }
+
+        if category_id is not None:
+            try:
+                fields["CATEGORY_ID"] = int(category_id)
+            except (TypeError, ValueError):
+                fields["CATEGORY_ID"] = category_id
+
+        if deal_data.get("designer_bitrix_id"):
+            fields["CONTACT_ID"] = deal_data.get("designer_bitrix_id")
+
+        if config.BITRIX_RESPONSIBLE_ID:
+            fields["ASSIGNED_BY_ID"] = config.BITRIX_RESPONSIBLE_ID
+
+        if crm_agent_name:
+            fields[config.BITRIX_CRM_AGENT_FIELD] = crm_agent_name
+
+        if project_file_url:
+            fields[config.BITRIX_PROJECT_FILE_FIELD] = project_file_url
+
+        if project_file_name:
+            fields[config.BITRIX_PROJECT_FILE_NAME_FIELD] = project_file_name
+
+        params = {"fields": fields}
+        result = await self._make_request("crm.deal.add", params)
+
+        if result.get("result"):
+            deal_id = result["result"]
+            logger.info(f"[create_partner_deal] ✅ Сделка создана с ID: {deal_id}")
+            deal_result = {
+                "id": deal_id,
+                "number": str(deal_id),
+                "status": stage_id or "",
+                "entity_type": "deal"
+            }
+            logger.info(f"[create_partner_deal] Результат: {json.dumps(deal_result, ensure_ascii=False)}")
+            return deal_result
+
+        logger.error(f"[create_partner_deal] ❌ Не удалось создать сделку: {result}")
         return None
 
     async def get_lead(self, lead_id: int) -> Optional[Dict]:
@@ -269,30 +362,26 @@ class BitrixAPI:
         logger.warning(f"[get_deal_status] ⚠️ Не удалось получить статус сделки")
         return None
 
-    async def get_stage_name(self, stage_id: str) -> str:
-        """Get human-readable stage name for both leads and deals"""
-        # This is a simplified mapping. In production, you should fetch this from Bitrix24
+    async def get_stage_name(self, stage_id: str, role: str = 'designer') -> str:
+        """Get human-readable stage name using configured mappings."""
+        if not stage_id:
+            return stage_id
 
-        # Lead statuses (STATUS_ID)
-        lead_mapping = {
-            "NEW": "Новый лид",
-            "IN_PROCESS": "В обработке",
-            "PROCESSED": "Обработан",
-            "JUNK": "Некачественный лид",
-            "CONVERTED": "Конвертирован в сделку"
-        }
+        normalized = _normalize_stage_id(stage_id)
+        mappings = []
 
-        # Deal stages (STAGE_ID)
-        deal_mapping = {
-            "NEW": "Новая заявка",
-            "PREPARATION": "Подготовка",
-            "PREPAYMENT_INVOICE": "Выставлен счет на предоплату",
-            "EXECUTING": "Выполняется",
-            "FINAL_INVOICE": "Выставлен финальный счет",
-            "WON": "Успешно реализовано",
-            "LOSE": "Закрыто и не реализовано"
-        }
+        if role == 'partner':
+            mappings.append(config.PARTNER_FUNNEL_STAGES)
+            mappings.append(config.DESIGNER_FUNNEL_STAGES)
+        else:
+            mappings.append(config.DESIGNER_FUNNEL_STAGES)
+            mappings.append(config.PARTNER_FUNNEL_STAGES)
 
-        # Try lead mapping first, then deal mapping
-        return lead_mapping.get(stage_id) or deal_mapping.get(stage_id, stage_id)
+        for mapping in mappings:
+            if stage_id in mapping:
+                return mapping[stage_id]
+            if normalized in mapping:
+                return mapping[normalized]
+
+        return stage_id
 

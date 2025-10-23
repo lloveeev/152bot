@@ -3,7 +3,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-import json
+from typing import Optional
 
 from database import Database
 from bitrix_api import BitrixAPI, validate_phone
@@ -12,8 +12,8 @@ from keyboards import (
     get_privacy_consent_keyboard,
     get_role_selection_keyboard,
     get_phone_request_keyboard,
-    get_designer_menu_keyboard,
-    get_cancel_keyboard
+    get_cancel_keyboard,
+    get_main_menu_keyboard
 )
 import config
 
@@ -21,20 +21,50 @@ router = Router()
 db = Database()
 bitrix = BitrixAPI()
 
+CANCEL_TEXT = "❌ Отмена"
+
+
+def _detect_role_from_start_param(start_param: str) -> Optional[str]:
+    """Return role key based on deep link start parameter if recognizable."""
+    if not start_param:
+        return None
+
+    cleaned = start_param.lower()
+    if cleaned.startswith("start="):
+        cleaned = cleaned.split("=", 1)[1]
+
+    if cleaned in {"designer", "desiner"}:
+        return "designer"
+    if cleaned in {"partner"}:
+        return "partner"
+    return None
+
+
+async def _begin_role_registration(message: Message, state: FSMContext, role: str):
+    """
+    Ask user for mandatory information according to selected role.
+    Currently both roles share the same flow, but the helper keeps logic centralized.
+    """
+    await state.update_data(role=role)
+    await message.answer(
+        "Отлично! Теперь введите ваше полное ФИО (Фамилия Имя Отчество):",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(RegistrationStates.waiting_for_full_name)
+
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     """Handle /start command with traffic source tracking"""
     user_id = message.from_user.id
+    await state.clear()
 
-    # deep_link rot ebal ego
     traffic_source = None
+    preselected_role = None
     if message.text and len(message.text.split()) > 1:
         start_param = message.text.split()[1]
-        if start_param.startswith("start="):
-            traffic_source = start_param.replace("start=", "").upper()
-        else:
-            traffic_source = start_param.upper()
+        traffic_source = start_param.upper()
+        preselected_role = _detect_role_from_start_param(start_param)
 
     user = await db.get_user(user_id)
 
@@ -42,17 +72,24 @@ async def cmd_start(message: Message, state: FSMContext):
         if user.get('privacy_consent') == 1:
             await message.answer(
                 f"С возвращением, {user.get('full_name', 'пользователь')}!",
-                reply_markup=get_designer_menu_keyboard() if user.get('role') == 'designer' else None
+                reply_markup=get_main_menu_keyboard(user.get('role')) if user.get('role') in config.USER_ROLES else None
             )
         else:
-            await start_privacy_flow(message, state, traffic_source)
+            await start_privacy_flow(message, state, traffic_source, preselected_role)
     else:
         await db.add_user(user_id, traffic_source)
-        await start_privacy_flow(message, state, traffic_source)
+        await start_privacy_flow(message, state, traffic_source, preselected_role)
 
 
-async def start_privacy_flow(message: Message, state: FSMContext, traffic_source: str = None):
+async def start_privacy_flow(
+    message: Message,
+    state: FSMContext,
+    traffic_source: str = None,
+    preselected_role: Optional[str] = None
+):
     """Start privacy consent flow"""
+    if preselected_role:
+        await state.update_data(preselected_role=preselected_role)
     await message.answer(
         f"👋 Добро пожаловать!\n\n"
         f"Для продолжения работы с ботом необходимо ознакомиться и принять условия "
@@ -68,16 +105,25 @@ async def start_privacy_flow(message: Message, state: FSMContext, traffic_source
 async def privacy_accepted(callback: CallbackQuery, state: FSMContext):
     """Handle privacy policy acceptance"""
     await db.update_user(callback.from_user.id, privacy_consent=1)
+    data = await state.get_data()
+    preselected_role = data.get('preselected_role')
 
-    await callback.message.edit_text(
-        "✅ Спасибо! Вы приняли условия обработки персональных данных.\n\n"
-        "Теперь давайте выберем вашу роль:"
-    )
-    await callback.message.answer(
-        "Пожалуйста, выберите вашу роль:",
-        reply_markup=get_role_selection_keyboard()
-    )
-    await state.set_state(RegistrationStates.waiting_for_role)
+    if preselected_role and preselected_role in config.USER_ROLES:
+        await callback.message.edit_text(
+            "✅ Спасибо! Вы приняли условия обработки персональных данных.\n\n"
+            f"Регистрируем вас как: {config.USER_ROLES[preselected_role]}."
+        )
+        await _begin_role_registration(callback.message, state, preselected_role)
+    else:
+        await callback.message.edit_text(
+            "✅ Спасибо! Вы приняли условия обработки персональных данных.\n\n"
+            "Теперь давайте выберем вашу роль:"
+        )
+        await callback.message.answer(
+            "Пожалуйста, выберите вашу роль:",
+            reply_markup=get_role_selection_keyboard()
+        )
+        await state.set_state(RegistrationStates.waiting_for_role)
     await callback.answer()
 
 
@@ -99,22 +145,13 @@ async def role_selected(callback: CallbackQuery, state: FSMContext):
     role = callback.data.replace("role_", "")
     role_name = config.USER_ROLES.get(role, "Неизвестная роль")
 
-    await state.update_data(role=role)
+    if role not in config.USER_ROLES:
+        await callback.message.edit_text("Не удалось определить выбранную роль. Попробуйте ещё раз.")
+        await callback.answer()
+        return
 
-    if role == "designer":
-        await callback.message.edit_text(f"✅ Вы выбрали роль: {role_name}")
-        await callback.message.answer(
-            "Отлично! Теперь введите ваше полное ФИО (Фамилия Имя Отчество):",
-            reply_markup=get_cancel_keyboard()
-        )
-        await state.set_state(RegistrationStates.waiting_for_full_name)
-    else:
-        await callback.message.edit_text(
-            f"🚧 Функционал для роли '{role_name}' находится в разработке.\n\n"
-            f"По всем вопросам обращайтесь к менеджеру: @{config.MANAGER_USERNAME}"
-        )
-        await db.update_user(callback.from_user.id, role=role)
-        await state.clear()
+    await callback.message.edit_text(f"✅ Вы выбрали роль: {role_name}")
+    await _begin_role_registration(callback.message, state, role)
 
     await callback.answer()
 
@@ -122,7 +159,7 @@ async def role_selected(callback: CallbackQuery, state: FSMContext):
 @router.message(RegistrationStates.waiting_for_full_name)
 async def full_name_entered(message: Message, state: FSMContext):
     """Handle full name input"""
-    if message.text == "❌ Отмена":
+    if message.text == CANCEL_TEXT:
         await message.answer("Регистрация отменена. Напишите /start для начала.")
         await state.clear()
         return
@@ -145,7 +182,7 @@ async def full_name_entered(message: Message, state: FSMContext):
 @router.message(RegistrationStates.waiting_for_company)
 async def company_entered(message: Message, state: FSMContext):
     """Handle company name input"""
-    if message.text == "❌ Отмена":
+    if message.text == CANCEL_TEXT:
         await message.answer("Регистрация отменена. Напишите /start для начала.")
         await state.clear()
         return
@@ -155,6 +192,7 @@ async def company_entered(message: Message, state: FSMContext):
 
     data = await state.get_data()
     full_name = data.get('full_name')
+    role = data.get('role', 'designer')
 
     bitrix_contact = await bitrix.find_contact_by_name(full_name)
 
@@ -185,7 +223,7 @@ async def company_entered(message: Message, state: FSMContext):
             company_name=company_name,
             phone=phone,
             email=email,
-            role='designer',
+            role=role,
             bitrix_id=bitrix_contact.get('ID')
         )
 
@@ -214,7 +252,7 @@ async def phone_shared(message: Message, state: FSMContext):
 @router.message(RegistrationStates.waiting_for_phone)
 async def phone_entered(message: Message, state: FSMContext):
     """Handle phone number entered manually"""
-    if message.text == "❌ Отмена":
+    if message.text == CANCEL_TEXT:
         await message.answer("Регистрация отменена. Напишите /start для начала.")
         await state.clear()
         return
@@ -246,7 +284,7 @@ async def phone_entered(message: Message, state: FSMContext):
 @router.message(RegistrationStates.waiting_for_email)
 async def email_entered(message: Message, state: FSMContext):
     """Handle email input"""
-    if message.text == "❌ Отмена":
+    if message.text == CANCEL_TEXT:
         await message.answer("Регистрация отменена. Напишите /start для начала.")
         await state.clear()
         return
@@ -271,6 +309,7 @@ async def email_entered(message: Message, state: FSMContext):
         "company_name": data.get('company_name'),
         "telegram_id": message.from_user.id
     }
+    contact_data["position"] = config.USER_ROLES.get(data.get('role', 'designer'), 'Дизайнер')
 
     bitrix_id = await bitrix.create_contact(contact_data)
 
@@ -283,7 +322,7 @@ async def email_entered(message: Message, state: FSMContext):
             company_name=data.get('company_name'),
             phone=data.get('phone'),
             email=email,
-            role='designer',
+            role=data.get('role', 'designer'),
             bitrix_id=bitrix_id
         )
 
@@ -298,9 +337,12 @@ async def email_entered(message: Message, state: FSMContext):
 
 async def complete_registration(message: Message, state: FSMContext):
     """Complete registration and show main menu"""
+    user = await db.get_user(message.from_user.id)
+    role = user.get('role') if user else 'designer'
+
     await message.answer(
         "🎉 Регистрация успешно завершена!\n\n"
-        "Теперь вы можете создавать сделки, просматривать их статус и участвовать в реферальной программе.",
-        reply_markup=get_designer_menu_keyboard()
+        "Теперь вы можете создавать сделки и отслеживать их статус прямо в боте.",
+        reply_markup=get_main_menu_keyboard(role)
     )
     await state.clear()

@@ -1,32 +1,220 @@
+import math
+from typing import Dict, List, Optional
+
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
-from typing import Dict
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from database import Database
 from bitrix_api import BitrixAPI, validate_phone
 from states import DealCreationStates, DealStatusStates
-from keyboards import get_designer_menu_keyboard, get_cancel_keyboard, get_confirmation_keyboard
+from keyboards import (
+    get_cancel_keyboard,
+    get_confirmation_keyboard,
+    get_main_menu_keyboard,
+)
 import config
 
 router = Router()
 db = Database()
 bitrix = BitrixAPI()
 
+CANCEL_TEXT = "❌ Отмена"
+DEALS_CALLBACK_PREFIX = "deals"
+PAGE_SIZE = max(config.DEALS_PAGE_SIZE, 1)
+
+
+def _normalize_status_code(status: str) -> str:
+    if not status:
+        return ""
+    value = status
+    if ":" in value:
+        value = value.split(":", 1)[1]
+    return value.upper()
+
+
+DESIGNER_ALLOWED_STATUS_CODES = {
+    _normalize_status_code(code) for code in config.DESIGNER_ALLOWED_STATUSES
+}
+PARTNER_ALLOWED_STATUS_CODES = {
+    _normalize_status_code(code) for code in config.PARTNER_ALLOWED_STATUSES
+}
+
+
+def _allowed_status_codes(role: str):
+    return PARTNER_ALLOWED_STATUS_CODES if role == "partner" else DESIGNER_ALLOWED_STATUS_CODES
+
+
+def _is_status_allowed(status: str, role: str) -> bool:
+    return _normalize_status_code(status) in _allowed_status_codes(role)
+
+
+def _menu_for_role(role: str):
+    return get_main_menu_keyboard(role)
+
+
+async def _get_role_from_state(state: FSMContext) -> str:
+    data = await state.get_data()
+    return data.get("owner_role", "designer")
+
+
+def _build_pagination_keyboard(role: str, page: int, total_pages: int) -> Optional[InlineKeyboardMarkup]:
+    if total_pages <= 1:
+        return None
+
+    buttons: List[InlineKeyboardButton] = []
+    if page > 0:
+        buttons.append(
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=f"{DEALS_CALLBACK_PREFIX}:{role}:{page - 1}",
+            )
+        )
+
+    buttons.append(
+        InlineKeyboardButton(
+            text=f"{page + 1}/{total_pages}",
+            callback_data=f"{DEALS_CALLBACK_PREFIX}:{role}:noop",
+        )
+    )
+
+    if page < total_pages - 1:
+        buttons.append(
+            InlineKeyboardButton(
+                text="➡️ Далее",
+                callback_data=f"{DEALS_CALLBACK_PREFIX}:{role}:{page + 1}",
+            )
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+def _format_deal_entry(deal: Dict) -> str:
+    status_name = deal.get("status_name") or config.UNKNOWN_STATUS_PLACEHOLDER
+    sync_status = deal.get("sync_status", "valid")
+    icon_map = {
+        "updated": "🆕",
+        "unsupported_status": "⚠️",
+        "valid": "📊",
+    }
+    status_icon = icon_map.get(sync_status, "📊")
+
+    lines = [
+        f"📌 Сделка #{deal.get('deal_number')}",
+        f"👤 Клиент: {deal.get('client_full_name')}",
+    ]
+    if deal.get("project_file_name"):
+        lines.append(f"📄 Файл: {deal.get('project_file_name')}")
+
+    lines.append(f"{status_icon} Статус: {status_name}")
+
+    if sync_status == "unsupported_status":
+        lines.append(f"ℹ️ {config.UNKNOWN_STATUS_PLACEHOLDER}")
+
+    lines.append(f"📅 Дата: {deal.get('created_date', '')[:10]}")
+
+    return "\n".join(lines)
+
+
+def _render_deals_page(deals: List[Dict], page: int, role: str) -> (str, Optional[InlineKeyboardMarkup]):
+    total_pages = max(math.ceil(len(deals) / PAGE_SIZE), 1)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE_SIZE
+    entries = deals[start:start + PAGE_SIZE]
+
+    lines = ["📋 Ваши сделки:", ""]
+    for deal in entries:
+        lines.append(_format_deal_entry(deal))
+        lines.append("─" * 30)
+        lines.append("")
+
+    text = "\n".join(lines).strip()
+    keyboard = _build_pagination_keyboard(role, page, total_pages)
+    return text, keyboard
+
+
+async def _sync_deal_with_bitrix(deal: Dict, fallback_role: str) -> Dict:
+    """
+    Sync single deal with Bitrix24 and enrich it with status info.
+    """
+    role = deal.get("owner_role", fallback_role)
+    deal_id = deal.get("bitrix_deal_id")
+    deal_number = deal.get("deal_number")
+    entity_type = deal.get("entity_type", "lead")
+
+    if entity_type == "deal":
+        current_status = await bitrix.get_deal_status(deal_id)
+    else:
+        current_status = await bitrix.get_lead_status(deal_id)
+
+    if current_status:
+        allowed = _is_status_allowed(current_status, role)
+
+        if allowed:
+            if current_status != deal.get("status"):
+                await db.update_deal_status(deal_number, current_status)
+                deal["status"] = current_status
+                deal["sync_status"] = "updated"
+            else:
+                deal["sync_status"] = "valid"
+
+            deal["status_name"] = await bitrix.get_stage_name(current_status, role=role)
+        else:
+            deal["status"] = current_status
+            deal["status_name"] = config.UNKNOWN_STATUS_PLACEHOLDER
+            deal["sync_status"] = "unsupported_status"
+    else:
+        deal["sync_status"] = "not_found"
+
+    return deal
+
+
+async def _sync_deals_for_user(telegram_id: int, role: str, *, drop_missing: bool) -> (List[Dict], List[Dict]):
+    deals = await db.get_user_deals(telegram_id)
+    synced: List[Dict] = []
+    invalid: List[Dict] = []
+
+    for deal in deals:
+        synced_deal = await _sync_deal_with_bitrix(deal, role)
+        if synced_deal.get("sync_status") == "not_found":
+            invalid.append(synced_deal)
+        else:
+            synced.append(synced_deal)
+
+    if drop_missing and invalid:
+        for deal in invalid:
+            await db.delete_deal(deal.get("deal_number"))
+
+    return synced, invalid
+
 
 @router.message(F.text == "📝 Новая сделка")
 async def new_deal_start(message: Message, state: FSMContext):
     """Start new deal creation"""
     user = await db.get_user(message.from_user.id)
+    role = user.get("role") if user else None
 
-    if not user or user.get('role') != 'designer':
-        await message.answer("❌ Эта функция доступна только для дизайнеров.")
+    if not user or role not in {"designer", "partner"}:
+        await message.answer("❌ Эта функция доступна только для зарегистрированных дизайнеров и партнеров.")
         return
 
+    if not user.get("bitrix_id"):
+        await message.answer(
+            "❌ Не удалось определить ваш Bitrix ID. Пожалуйста, завершите регистрацию или обратитесь к менеджеру.",
+            reply_markup=_menu_for_role(role),
+        )
+        return
+
+    await state.update_data(owner_role=role)
+
     await message.answer(
-        "📝 Создание новой сделки\n\n"
-        "Введите ФИО клиента:",
-        reply_markup=get_cancel_keyboard()
+        "📝 Создание новой сделки\n\nВведите ФИО клиента:",
+        reply_markup=get_cancel_keyboard(),
     )
     await state.set_state(DealCreationStates.waiting_for_client_name)
 
@@ -34,8 +222,10 @@ async def new_deal_start(message: Message, state: FSMContext):
 @router.message(DealCreationStates.waiting_for_client_name)
 async def client_name_entered(message: Message, state: FSMContext):
     """Handle client name input"""
-    if message.text == "❌ Отмена":
-        await message.answer("Создание сделки отменено.", reply_markup=get_designer_menu_keyboard())
+    role = await _get_role_from_state(state)
+
+    if message.text == CANCEL_TEXT:
+        await message.answer("Создание сделки отменено.", reply_markup=_menu_for_role(role))
         await state.clear()
         return
 
@@ -54,8 +244,10 @@ async def client_name_entered(message: Message, state: FSMContext):
 @router.message(DealCreationStates.waiting_for_client_phone)
 async def client_phone_entered(message: Message, state: FSMContext):
     """Handle client phone input"""
-    if message.text == "❌ Отмена":
-        await message.answer("Создание сделки отменено.", reply_markup=get_designer_menu_keyboard())
+    role = await _get_role_from_state(state)
+
+    if message.text == CANCEL_TEXT:
+        await message.answer("Создание сделки отменено.", reply_markup=_menu_for_role(role))
         await state.clear()
         return
 
@@ -75,8 +267,7 @@ async def client_phone_entered(message: Message, state: FSMContext):
     await state.update_data(client_phone=client_phone)
 
     await message.answer(
-        "Прикрепите файл проекта в формате PDF:\n"
-        "(Отправьте PDF-файл или документ)"
+        "Прикрепите файл проекта в формате PDF:\n(Отправьте PDF-файл или документ)"
     )
     await state.set_state(DealCreationStates.waiting_for_project_file)
 
@@ -86,7 +277,7 @@ async def project_file_uploaded(message: Message, state: FSMContext):
     """Handle project file upload"""
     document = message.document
 
-    if document.mime_type != 'application/pdf':
+    if document.mime_type != "application/pdf":
         await message.answer(
             "⚠️ Пожалуйста, отправьте файл в формате PDF.\n"
             "Если хотите отменить, нажмите кнопку 'Отмена'."
@@ -102,8 +293,10 @@ async def project_file_uploaded(message: Message, state: FSMContext):
 @router.message(DealCreationStates.waiting_for_project_file)
 async def project_file_invalid(message: Message, state: FSMContext):
     """Handle invalid project file"""
-    if message.text == "❌ Отмена":
-        await message.answer("Создание сделки отменено.", reply_markup=get_designer_menu_keyboard())
+    role = await _get_role_from_state(state)
+
+    if message.text == CANCEL_TEXT:
+        await message.answer("Создание сделки отменено.", reply_markup=_menu_for_role(role))
         await state.clear()
         return
 
@@ -113,8 +306,10 @@ async def project_file_invalid(message: Message, state: FSMContext):
 @router.message(DealCreationStates.waiting_for_comment)
 async def comment_entered(message: Message, state: FSMContext):
     """Handle comment input"""
-    if message.text == "❌ Отмена":
-        await message.answer("Создание сделки отменено.", reply_markup=get_designer_menu_keyboard())
+    role = await _get_role_from_state(state)
+
+    if message.text == CANCEL_TEXT:
+        await message.answer("Создание сделки отменено.", reply_markup=_menu_for_role(role))
         await state.clear()
         return
 
@@ -122,7 +317,6 @@ async def comment_entered(message: Message, state: FSMContext):
     await state.update_data(comment=comment)
 
     data = await state.get_data()
-    user = await db.get_user(message.from_user.id)
 
     confirmation_text = (
         "📋 Проверьте данные сделки:\n\n"
@@ -130,7 +324,7 @@ async def comment_entered(message: Message, state: FSMContext):
         f"📱 Телефон: {data.get('client_phone')}\n"
         f"📄 Файл: {data.get('project_file_name')}\n"
         f"💬 Комментарий: {comment}\n\n"
-        f"✅ Подтвердить создание сделки?"
+        "✅ Подтвердить создание сделки?"
     )
 
     await message.answer(confirmation_text, reply_markup=get_confirmation_keyboard())
@@ -142,44 +336,59 @@ async def deal_confirmed(callback: CallbackQuery, state: FSMContext):
     """Handle deal confirmation"""
     data = await state.get_data()
     user = await db.get_user(callback.from_user.id)
+    role = data.get("owner_role", user.get("role", "designer") if user else "designer")
 
     await callback.message.edit_text("⏳ Создаю сделку в системе...")
 
     deal_data = {
-        "designer_name": user.get('full_name'),
-        "designer_bitrix_id": user.get('bitrix_id'),
-        "client_full_name": data.get('client_name'),
-        "client_phone": data.get('client_phone'),
-        "project_file_url": data.get('project_file_id'),  # In real scenario, upload to Bitrix
-        "comment": data.get('comment')
+        "designer_name": user.get("full_name"),
+        "designer_bitrix_id": user.get("bitrix_id"),
+        "designer_role_key": role,
+        "designer_role_title": config.USER_ROLES.get(role, role.title()),
+        "crm_agent_name": user.get("full_name"),
+        "client_full_name": data.get("client_name"),
+        "client_phone": data.get("client_phone"),
+        "project_file_url": data.get("project_file_id"),  # В проде нужно загружать файл в Bitrix
+        "project_file_name": data.get("project_file_name"),
+        "comment": data.get("comment"),
+        "owner_role": role,
+        "stage_id": config.BITRIX_PARTNER_INITIAL_STAGE if role == "partner" else None,
     }
 
-    bitrix_deal = await bitrix.create_lead(deal_data)
+    if role == "partner":
+        bitrix_deal = await bitrix.create_partner_deal(deal_data)
+    else:
+        bitrix_deal = await bitrix.create_lead(deal_data)
 
     if bitrix_deal:
         await db.add_deal({
-            "deal_number": bitrix_deal.get('number'),
-            "bitrix_deal_id": bitrix_deal.get('id'),
+            "deal_number": bitrix_deal.get("number"),
+            "bitrix_deal_id": bitrix_deal.get("id"),
             "designer_telegram_id": callback.from_user.id,
-            "client_full_name": data.get('client_name'),
-            "client_phone": data.get('client_phone'),
-            "project_file_id": data.get('project_file_id'),
-            "comment": data.get('comment'),
-            "status": bitrix_deal.get('status', 'NEW')
+            "client_full_name": data.get("client_name"),
+            "client_phone": data.get("client_phone"),
+            "project_file_id": data.get("project_file_id"),
+            "project_file_name": data.get("project_file_name"),
+            "comment": data.get("comment"),
+            "status": bitrix_deal.get("status", ""),
+            "entity_type": bitrix_deal.get("entity_type", "lead"),
+            "owner_role": role,
         })
+
+        status_name = await bitrix.get_stage_name(bitrix_deal.get("status", ""), role=role)
 
         await callback.message.answer(
             f"✅ Сделка успешно создана!\n\n"
             f"📋 Номер сделки: {bitrix_deal.get('number')}\n"
-            f"📊 Статус: {await bitrix.get_stage_name(bitrix_deal.get('status', 'NEW'))}\n\n"
-            f"Вы можете отслеживать статус через меню 'Мои сделки' или 'Узнать статус'",
-            reply_markup=get_designer_menu_keyboard()
+            f"📊 Статус: {status_name}\n\n"
+            "Вы можете отслеживать статус через меню 'Мои сделки' или 'Узнать статус'.",
+            reply_markup=_menu_for_role(role),
         )
     else:
         await callback.message.answer(
             "❌ Произошла ошибка при создании сделки в системе.\n"
             f"Пожалуйста, обратитесь к менеджеру: @{config.MANAGER_USERNAME}",
-            reply_markup=get_designer_menu_keyboard()
+            reply_markup=_menu_for_role(role),
         )
 
     await state.clear()
@@ -189,163 +398,126 @@ async def deal_confirmed(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "confirm_no", DealCreationStates.confirming_deal)
 async def deal_cancelled(callback: CallbackQuery, state: FSMContext):
     """Handle deal cancellation"""
+    role = await _get_role_from_state(state)
+
     await callback.message.edit_text("❌ Создание сделки отменено.")
-    await callback.message.answer("Возвращаюсь в главное меню.", reply_markup=get_designer_menu_keyboard())
+    await callback.message.answer("Возвращаюсь в главное меню.", reply_markup=_menu_for_role(role))
     await state.clear()
     await callback.answer()
-
-
-async def sync_deal_with_bitrix(deal: Dict) -> Dict:
-    """
-    Sync single deal with Bitrix24 and validate it
-    Returns updated deal with sync status
-    """
-    deal_id = deal.get('bitrix_deal_id')
-    deal_number = deal.get('deal_number')
-
-    # Try to get current status from Bitrix
-    current_status = await bitrix.get_lead_status(deal_id)
-
-    if current_status:
-        # Deal exists in Bitrix - update if status changed
-        if current_status != deal.get('status'):
-            await db.update_deal_status(deal_number, current_status)
-            deal['status'] = current_status
-            deal['sync_status'] = 'updated'
-        else:
-            deal['sync_status'] = 'valid'
-    else:
-        # Deal not found in Bitrix - mark as invalid
-        deal['sync_status'] = 'not_found'
-
-    return deal
 
 
 @router.message(F.text == "📋 Мои сделки")
 async def my_deals(message: Message):
     """Show user's deals with Bitrix validation"""
     user = await db.get_user(message.from_user.id)
+    role = user.get("role") if user else None
 
-    if not user or user.get('role') != 'designer':
-        await message.answer("❌ Эта функция доступна только для дизайнеров.")
+    if not user or role not in {"designer", "partner"}:
+        await message.answer("❌ Эта функция доступна только для зарегистрированных дизайнеров и партнеров.")
         return
 
     deals = await db.get_user_deals(message.from_user.id)
 
     if not deals:
         await message.answer(
-            "У вас пока нет созданных сделок.\n\n"
-            "Создайте первую сделку через меню 'Новая сделка'!",
-            reply_markup=get_designer_menu_keyboard()
+            "У вас пока нет активных сделок.\n\nСоздайте новую сделку через меню 'Новая сделка'!",
+            reply_markup=_menu_for_role(role),
         )
         return
 
-    # Show loading message
-    loading_msg = await message.answer("🔄 Синхронизация с Битрикс24...")
+    loading_msg = await message.answer("⏳ Синхронизирую сделки с Bitrix24...")
 
-    # Sync all deals with Bitrix
-    synced_deals = []
-    for deal in deals:
-        synced_deal = await sync_deal_with_bitrix(deal)
-        synced_deals.append(synced_deal)
+    valid_deals, invalid_deals = await _sync_deals_for_user(
+        message.from_user.id,
+        role,
+        drop_missing=True,
+    )
 
-    # Separate valid and invalid deals
-    valid_deals = []
-    invalid_deals = []
-
-    for deal in synced_deals:
-        if deal.get('sync_status') == 'not_found':
-            invalid_deals.append(deal)
-        else:
-            valid_deals.append(deal)
-
-    # If there are invalid deals, show them and delete from DB
     if invalid_deals:
-        invalid_text = "⚠️ Следующие сделки не найдены в Битрикс24 и будут удалены из списка:\n\n"
-
+        invalid_text_lines = [
+            "⚠️ Некоторые сделки не найдены в Bitrix24 и были удалены из списка:",
+            "",
+        ]
         for deal in invalid_deals:
-            invalid_text += (
-                f"📌 Сделка #{deal.get('deal_number')}\n"
-                f"👤 Клиент: {deal.get('client_full_name')}\n"
-                f"📅 Дата создания: {deal.get('created_date', '')[:10]}\n"
-                f"{'─' * 30}\n\n"
-            )
-
-        invalid_text += (
-            f"⚠️ Удалено сделок: {len(invalid_deals)}\n"
-            f"Если это ошибка, обратитесь к менеджеру: @{config.MANAGER_USERNAME}"
+            invalid_text_lines.extend([
+                f"📌 Сделка #{deal.get('deal_number')}",
+                f"👤 Клиент: {deal.get('client_full_name')}",
+                f"📅 Дата: {deal.get('created_date', '')[:10]}",
+                "─" * 30,
+            ])
+        invalid_text_lines.append(
+            f"Если нужна помощь, свяжитесь с менеджером @{config.MANAGER_USERNAME}."
         )
+        await message.answer("\n".join(invalid_text_lines))
 
-        # Delete invalid deals from database
-        for deal in invalid_deals:
-            await db.delete_deal(deal.get('deal_number'))
-
-        # Show invalid deals message
-        await loading_msg.delete()
-        await message.answer(invalid_text)
-
-    # Show valid deals if any
-    if valid_deals:
-        deals_text = "📋 Ваши активные сделки:\n\n"
-
-        for deal in valid_deals:
-            sync_status = deal.get('sync_status')
-            status_name = await bitrix.get_stage_name(deal.get('status', 'NEW'))
-            status_icon = "🆕" if sync_status == 'updated' else "📊"
-
-            deals_text += (
-                f"📌 Сделка #{deal.get('deal_number')}\n"
-                f"👤 Клиент: {deal.get('client_full_name')}\n"
-                f"{status_icon} Статус: {status_name}"
-            )
-
-            if sync_status == 'updated':
-                deals_text += " (обновлено)\n"
-            else:
-                deals_text += "\n"
-
-            deals_text += (
-                f"📅 Дата: {deal.get('created_date', '')[:10]}\n"
-                f"{'─' * 30}\n\n"
-            )
-
-        if invalid_deals:
-            # Loading message already deleted, just send deals
-            await message.answer(deals_text, reply_markup=get_designer_menu_keyboard())
-        else:
-            # Delete loading message and send deals
-            await loading_msg.delete()
-            await message.answer(deals_text, reply_markup=get_designer_menu_keyboard())
-    elif not invalid_deals:
-        # No deals at all (shouldn't happen as we check earlier, but just in case)
+    if not valid_deals:
         await loading_msg.delete()
         await message.answer(
-            "У вас пока нет активных сделок.\n\n"
-            "Создайте новую сделку через меню 'Новая сделка'!",
-            reply_markup=get_designer_menu_keyboard()
+            "Список актуальных сделок пуст.\nСоздайте новую сделку через меню 'Новая сделка'!",
+            reply_markup=_menu_for_role(role),
         )
-    else:
-        # All deals were invalid and deleted
-        await message.answer(
-            "Все сделки были удалены из списка.\n\n"
-            "Создайте новую сделку через меню 'Новая сделка'!",
-            reply_markup=get_designer_menu_keyboard()
+        return
+
+    text, keyboard = _render_deals_page(valid_deals, page=0, role=role)
+    await loading_msg.delete()
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith(f"{DEALS_CALLBACK_PREFIX}:"))
+async def paginate_deals(callback: CallbackQuery):
+    """Handle deals pagination callbacks"""
+    parts = callback.data.split(":")
+
+    if len(parts) != 3:
+        await callback.answer()
+        return
+
+    _, role, target = parts
+
+    if target == "noop":
+        await callback.answer()
+        return
+
+    try:
+        page = int(target)
+    except ValueError:
+        await callback.answer()
+        return
+
+    valid_deals, _ = await _sync_deals_for_user(
+        callback.from_user.id,
+        role,
+        drop_missing=False,
+    )
+
+    if not valid_deals:
+        await callback.message.edit_text(
+            "Список сделок пуст.",
+            reply_markup=None,
         )
+        await callback.answer()
+        return
+
+    text, keyboard = _render_deals_page(valid_deals, page=page, role=role)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
 
 
 @router.message(F.text == "🔍 Узнать статус")
 async def check_status_start(message: Message, state: FSMContext):
     """Start deal status check"""
     user = await db.get_user(message.from_user.id)
+    role = user.get("role") if user else None
 
-    if not user or user.get('role') != 'designer':
-        await message.answer("❌ Эта функция доступна только для дизайнеров.")
+    if not user or role not in {"designer", "partner"}:
+        await message.answer("❌ Эта функция доступна только для зарегистрированных дизайнеров и партнеров.")
         return
 
+    await state.update_data(owner_role=role)
+
     await message.answer(
-        "🔍 Проверка статуса сделки\n\n"
-        "Введите номер сделки:",
-        reply_markup=get_cancel_keyboard()
+        "🔍 Проверка статуса сделки\n\nВведите номер сделки:",
+        reply_markup=get_cancel_keyboard(),
     )
     await state.set_state(DealStatusStates.waiting_for_deal_number)
 
@@ -353,8 +525,10 @@ async def check_status_start(message: Message, state: FSMContext):
 @router.message(DealStatusStates.waiting_for_deal_number)
 async def deal_number_entered(message: Message, state: FSMContext):
     """Handle deal number input"""
-    if message.text == "❌ Отмена":
-        await message.answer("Операция отменена.", reply_markup=get_designer_menu_keyboard())
+    role = await _get_role_from_state(state)
+
+    if message.text == CANCEL_TEXT:
+        await message.answer("Операция отменена.", reply_markup=_menu_for_role(role))
         await state.clear()
         return
 
@@ -364,24 +538,30 @@ async def deal_number_entered(message: Message, state: FSMContext):
 
     if not deal:
         await message.answer(
-            f"❌ Сделка с номером {deal_number} не найдена.\n"
-            "Проверьте номер и попробуйте снова."
+            f"❌ Сделка с номером {deal_number} не найдена.\nПроверьте номер и попробуйте снова."
         )
         return
 
-    if deal.get('designer_telegram_id') != message.from_user.id:
-        await message.answer(
-            "❌ Эта сделка вам не принадлежит."
-        )
+    if deal.get("designer_telegram_id") != message.from_user.id:
+        await message.answer("❌ Эта сделка вам не принадлежит.")
         await state.clear()
         return
 
-    current_status = await bitrix.get_lead_status(deal.get('bitrix_deal_id'))
+    deal_role = deal.get("owner_role", role)
+    entity_type = deal.get("entity_type", "lead")
+
+    if entity_type == "deal":
+        current_status = await bitrix.get_deal_status(deal.get("bitrix_deal_id"))
+    else:
+        current_status = await bitrix.get_lead_status(deal.get("bitrix_deal_id"))
 
     if current_status:
-        # Update local database
         await db.update_deal_status(deal_number, current_status)
-        status_name = await bitrix.get_stage_name(current_status)
+
+        if _is_status_allowed(current_status, deal_role):
+            status_name = await bitrix.get_stage_name(current_status, role=deal_role)
+        else:
+            status_name = config.UNKNOWN_STATUS_PLACEHOLDER
 
         await message.answer(
             f"📊 Статус сделки #{deal_number}\n\n"
@@ -389,24 +569,35 @@ async def deal_number_entered(message: Message, state: FSMContext):
             f"📱 Телефон: {deal.get('client_phone')}\n"
             f"📊 Текущий статус: {status_name}\n"
             f"📅 Дата создания: {deal.get('created_date', '')[:10]}",
-            reply_markup=get_designer_menu_keyboard()
+            reply_markup=_menu_for_role(role),
         )
     else:
         await message.answer(
             "❌ Не удалось получить актуальный статус из системы.\n"
             f"Обратитесь к менеджеру: @{config.MANAGER_USERNAME}",
-            reply_markup=get_designer_menu_keyboard()
+            reply_markup=_menu_for_role(role),
         )
 
     await state.clear()
 
 
-@router.message(F.text == "🎁 Реферальная программа")
-async def referral_program(message: Message):
-    """Show referral program info"""
-    await message.answer(
-        "🎁 Реферальная программа\n\n"
-        "🚧 Данный раздел находится в разработке.\n\n"
-        f"Для получения подробной информации обратитесь к менеджеру: @{config.MANAGER_USERNAME}",
-        reply_markup=get_designer_menu_keyboard()
-    )
+@router.message(F.text.in_({"🎁 Реферальная программа", "🤝 Партнерская программа"}))
+async def program_info(message: Message):
+    """Show program info for designers and partners"""
+    user = await db.get_user(message.from_user.id)
+    role = user.get("role") if user else "designer"
+
+    if message.text == "🎁 Реферальная программа":
+        text = (
+            "🎁 Реферальная программа\n\n"
+            "🚧 Данный раздел находится в разработке.\n\n"
+            f"Для подробностей свяжитесь с менеджером: @{config.MANAGER_USERNAME}"
+        )
+    else:
+        text = (
+            "🤝 Партнерская программа\n\n"
+            "🚧 Информация появится здесь позже.\n\n"
+            f"По всем вопросам обращайтесь к менеджеру: @{config.MANAGER_USERNAME}"
+        )
+
+    await message.answer(text, reply_markup=_menu_for_role(role))
