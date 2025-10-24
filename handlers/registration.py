@@ -4,6 +4,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from typing import Optional
+import re
 
 from database import Database
 from bitrix_api import BitrixAPI, validate_phone
@@ -22,6 +23,29 @@ db = Database()
 bitrix = BitrixAPI()
 
 CANCEL_TEXT = "❌ Отмена"
+INVALID_PHONE_MESSAGE = (
+    "❌ Неверный формат номера телефона.\n\n"
+    "Пожалуйста, введите номер в правильном формате:\n"
+    "• +79161234567\n"
+    "• 89161234567\n"
+    "• 79161234567\n"
+    "• 9161234567\n\n"
+    "Или воспользуйтесь кнопкой 'Поделиться номером'"
+)
+EMAIL_REGEX = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$"
+)
+INVALID_EMAIL_MESSAGE = (
+    "❌ Неверный формат email.\n"
+    "Убедитесь, что адрес выглядит как example@domain.ru без пробелов и лишних символов."
+)
+
+
+def _is_valid_email(email: str) -> bool:
+    """Return True if email has an acceptable format."""
+    if not email or len(email) > 254:
+        return False
+    return bool(EMAIL_REGEX.match(email.strip()))
 
 
 def _detect_role_from_start_param(start_param: str) -> Optional[str]:
@@ -70,12 +94,37 @@ async def cmd_start(message: Message, state: FSMContext):
 
     if user:
         if user.get('privacy_consent') == 1:
+            full_name = (user.get('full_name') or "").strip()
+            role = user.get('role')
+
+            if not full_name:
+                await message.answer(
+                    "Похоже, вы ещё не завершили регистрацию. Давайте заполним данные."
+                )
+
+                if role in config.USER_ROLES:
+                    await _begin_role_registration(message, state, role)
+                elif preselected_role and preselected_role in config.USER_ROLES:
+                    await _begin_role_registration(message, state, preselected_role)
+                else:
+                    if preselected_role:
+                        await state.update_data(preselected_role=preselected_role)
+                    await message.answer(
+                        "Пожалуйста, выберите вашу роль, чтобы пройти регистрацию:",
+                        reply_markup=get_role_selection_keyboard()
+                    )
+                    await state.set_state(RegistrationStates.waiting_for_role)
+                return
+
+            greeting_name = full_name.split()[0]
             await message.answer(
-                f"С возвращением, {user.get('full_name', 'пользователь')}!",
-                reply_markup=get_main_menu_keyboard(user.get('role')) if user.get('role') in config.USER_ROLES else None
+                f"С возвращением, {greeting_name}!",
+                reply_markup=get_main_menu_keyboard(role) if role in config.USER_ROLES else None
             )
-        else:
-            await start_privacy_flow(message, state, traffic_source, preselected_role)
+            return
+
+        await start_privacy_flow(message, state, traffic_source, preselected_role)
+        return
     else:
         await db.add_user(user_id, traffic_source)
         await start_privacy_flow(message, state, traffic_source, preselected_role)
@@ -239,7 +288,15 @@ async def company_entered(message: Message, state: FSMContext):
 @router.message(RegistrationStates.waiting_for_phone, F.contact)
 async def phone_shared(message: Message, state: FSMContext):
     """Handle phone number shared via button"""
-    phone = message.contact.phone_number
+    phone = message.contact.phone_number.strip()
+
+    if not validate_phone(phone):
+        await message.answer(
+            INVALID_PHONE_MESSAGE,
+            reply_markup=get_phone_request_keyboard()
+        )
+        return
+
     await state.update_data(phone=phone)
 
     await message.answer(
@@ -261,13 +318,7 @@ async def phone_entered(message: Message, state: FSMContext):
 
     if not validate_phone(phone):
         await message.answer(
-            "❌ Неверный формат номера телефона.\n\n"
-            "Пожалуйста, введите номер в правильном формате:\n"
-            "• +79161234567\n"
-            "• 89161234567\n"
-            "• 79161234567\n"
-            "• 9161234567\n\n"
-            "Или используйте кнопку 'Поделиться номером'",
+            INVALID_PHONE_MESSAGE,
             reply_markup=get_phone_request_keyboard()
         )
         return
@@ -289,12 +340,13 @@ async def email_entered(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    email = message.text.strip()
+    email_raw = message.text.strip()
 
-    if '@' not in email or '.' not in email:
-        await message.answer("Пожалуйста, введите корректный email:")
+    if not _is_valid_email(email_raw):
+        await message.answer(INVALID_EMAIL_MESSAGE)
         return
 
+    email = email_raw.lower()
     await state.update_data(email=email)
 
     data = await state.get_data()

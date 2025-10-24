@@ -4,7 +4,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from database import Database
-from handlers import registration, deals, admin
+from handlers import registration, leads, admin
 import config
 
 # официально питона рот ебал сучка ебанная сексуальная
@@ -28,7 +28,7 @@ async def main():
 
 
     dp.include_router(registration.router)
-    dp.include_router(deals.router)
+    dp.include_router(leads.router)
     dp.include_router(admin.router)
 
     logger.info("Bot started")

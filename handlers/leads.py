@@ -1,4 +1,6 @@
+import logging
 import math
+from io import BytesIO
 from typing import Dict, List, Optional
 
 from aiogram import Router, F
@@ -12,7 +14,7 @@ from aiogram.types import (
 
 from database import Database
 from bitrix_api import BitrixAPI, validate_phone
-from states import DealCreationStates, DealStatusStates
+from states import LeadCreationStates, LeadStatusStates
 from keyboards import (
     get_cancel_keyboard,
     get_confirmation_keyboard,
@@ -20,13 +22,15 @@ from keyboards import (
 )
 import config
 
+logger = logging.getLogger(__name__)
+
 router = Router()
 db = Database()
 bitrix = BitrixAPI()
 
 CANCEL_TEXT = "❌ Отмена"
-DEALS_CALLBACK_PREFIX = "deals"
-PAGE_SIZE = max(config.DEALS_PAGE_SIZE, 1)
+LEADS_CALLBACK_PREFIX = "leads"
+PAGE_SIZE = max(config.LEADS_PAGE_SIZE, 1)
 
 
 def _normalize_status_code(status: str) -> str:
@@ -63,6 +67,53 @@ async def _get_role_from_state(state: FSMContext) -> str:
     return data.get("owner_role", "designer")
 
 
+def _default_source_id() -> str:
+    return config.BITRIX_DEFAULT_SOURCE_ID or config.BITRIX_LEAD_SOURCE_ID or "TELEGRAM"
+
+
+def _default_source_name() -> str:
+    return config.BITRIX_SOURCE_DESCRIPTION or "Telegram"
+
+
+async def _set_default_source(state: FSMContext):
+    source_id = _default_source_id()
+    source_name = _default_source_name()
+    codes = [source_id] if source_id else []
+    await state.update_data(
+        source_id=source_id,
+        source_name=source_name,
+        source_codes=codes,
+    )
+
+
+def _build_confirmation_text(data: Dict) -> str:
+    project_file = data.get("project_file_name") or "—"
+    comment = data.get("comment") or "—"
+    source_id = data.get("source_id") or _default_source_id()
+    source_name = data.get("source_name") or _default_source_name()
+    source_line = source_name
+    if source_id:
+        source_line = f"{source_line} ({source_id})"
+
+    return (
+        "📋 Проверьте данные сделки:\n\n"
+        f"👤 Клиент: {data.get('client_name')}\n"
+        f"📱 Телефон: {data.get('client_phone')}\n"
+        f"📄 Файл: {project_file}\n"
+        f"🏷 Источник обращения: {source_line}\n"
+        f"💬 Комментарий: {comment}\n\n"
+        "✅ Подтвердить создание сделки?"
+    )
+
+
+async def _send_confirmation(message: Message, state: FSMContext):
+    await _set_default_source(state)
+    data = await state.get_data()
+    confirmation_text = _build_confirmation_text(data)
+    await message.answer(confirmation_text, reply_markup=get_confirmation_keyboard())
+    await state.set_state(LeadCreationStates.confirming_lead)
+
+
 def _build_pagination_keyboard(role: str, page: int, total_pages: int) -> Optional[InlineKeyboardMarkup]:
     if total_pages <= 1:
         return None
@@ -72,14 +123,14 @@ def _build_pagination_keyboard(role: str, page: int, total_pages: int) -> Option
         buttons.append(
             InlineKeyboardButton(
                 text="⬅️ Назад",
-                callback_data=f"{DEALS_CALLBACK_PREFIX}:{role}:{page - 1}",
+                callback_data=f"{LEADS_CALLBACK_PREFIX}:{role}:{page - 1}",
             )
         )
 
     buttons.append(
         InlineKeyboardButton(
             text=f"{page + 1}/{total_pages}",
-            callback_data=f"{DEALS_CALLBACK_PREFIX}:{role}:noop",
+            callback_data=f"{LEADS_CALLBACK_PREFIX}:{role}:noop",
         )
     )
 
@@ -87,16 +138,16 @@ def _build_pagination_keyboard(role: str, page: int, total_pages: int) -> Option
         buttons.append(
             InlineKeyboardButton(
                 text="➡️ Далее",
-                callback_data=f"{DEALS_CALLBACK_PREFIX}:{role}:{page + 1}",
+                callback_data=f"{LEADS_CALLBACK_PREFIX}:{role}:{page + 1}",
             )
         )
 
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-def _format_deal_entry(deal: Dict) -> str:
-    status_name = deal.get("status_name") or config.UNKNOWN_STATUS_PLACEHOLDER
-    sync_status = deal.get("sync_status", "valid")
+def _format_lead_entry(lead: Dict) -> str:
+    status_name = lead.get("status_name") or config.UNKNOWN_STATUS_PLACEHOLDER
+    sync_status = lead.get("sync_status", "valid")
     icon_map = {
         "updated": "🆕",
         "unsupported_status": "⚠️",
@@ -105,31 +156,28 @@ def _format_deal_entry(deal: Dict) -> str:
     status_icon = icon_map.get(sync_status, "📊")
 
     lines = [
-        f"📌 Сделка #{deal.get('deal_number')}",
-        f"👤 Клиент: {deal.get('client_full_name')}",
+        f"📌 Сделка #{lead.get('lead_number')}",
+        f"👤 Клиент: {lead.get('client_full_name')}",
     ]
-    if deal.get("project_file_name"):
-        lines.append(f"📄 Файл: {deal.get('project_file_name')}")
+    if lead.get("project_file_name"):
+        lines.append(f"📄 Файл: {lead.get('project_file_name')}")
 
     lines.append(f"{status_icon} Статус: {status_name}")
 
-    if sync_status == "unsupported_status":
-        lines.append(f"ℹ️ {config.UNKNOWN_STATUS_PLACEHOLDER}")
-
-    lines.append(f"📅 Дата: {deal.get('created_date', '')[:10]}")
+    lines.append(f"📅 Дата: {lead.get('created_date', '')[:10]}")
 
     return "\n".join(lines)
 
 
-def _render_deals_page(deals: List[Dict], page: int, role: str) -> (str, Optional[InlineKeyboardMarkup]):
-    total_pages = max(math.ceil(len(deals) / PAGE_SIZE), 1)
+def _render_leads_page(leads: List[Dict], page: int, role: str) -> (str, Optional[InlineKeyboardMarkup]):
+    total_pages = max(math.ceil(len(leads) / PAGE_SIZE), 1)
     page = max(0, min(page, total_pages - 1))
     start = page * PAGE_SIZE
-    entries = deals[start:start + PAGE_SIZE]
+    entries = leads[start:start + PAGE_SIZE]
 
     lines = ["📋 Ваши сделки:", ""]
-    for deal in entries:
-        lines.append(_format_deal_entry(deal))
+    for lead in entries:
+        lines.append(_format_lead_entry(lead))
         lines.append("─" * 30)
         lines.append("")
 
@@ -138,64 +186,59 @@ def _render_deals_page(deals: List[Dict], page: int, role: str) -> (str, Optiona
     return text, keyboard
 
 
-async def _sync_deal_with_bitrix(deal: Dict, fallback_role: str) -> Dict:
+async def _sync_lead_with_bitrix(lead: Dict, fallback_role: str) -> Dict:
     """
-    Sync single deal with Bitrix24 and enrich it with status info.
+    Sync single lead with Bitrix24 and enrich it with status info.
     """
-    role = deal.get("owner_role", fallback_role)
-    deal_id = deal.get("bitrix_deal_id")
-    deal_number = deal.get("deal_number")
-    entity_type = deal.get("entity_type", "lead")
-
-    if entity_type == "deal":
-        current_status = await bitrix.get_deal_status(deal_id)
-    else:
-        current_status = await bitrix.get_lead_status(deal_id)
+    role = lead.get("owner_role", fallback_role)
+    lead_id = lead.get("bitrix_lead_id")
+    lead_number = lead.get("lead_number")
+    current_status = await bitrix.get_lead_status(lead_id)
 
     if current_status:
         allowed = _is_status_allowed(current_status, role)
+        stage_name = await bitrix.get_stage_name(current_status, role=role)
 
         if allowed:
-            if current_status != deal.get("status"):
-                await db.update_deal_status(deal_number, current_status)
-                deal["status"] = current_status
-                deal["sync_status"] = "updated"
+            if current_status != lead.get("status"):
+                await db.update_lead_status(lead_number, current_status)
+                lead["status"] = current_status
+                lead["sync_status"] = "updated"
             else:
-                deal["sync_status"] = "valid"
-
-            deal["status_name"] = await bitrix.get_stage_name(current_status, role=role)
+                lead["sync_status"] = "valid"
         else:
-            deal["status"] = current_status
-            deal["status_name"] = config.UNKNOWN_STATUS_PLACEHOLDER
-            deal["sync_status"] = "unsupported_status"
+            lead["status"] = current_status
+            lead["sync_status"] = "unsupported_status"
+
+        lead["status_name"] = stage_name or config.UNKNOWN_STATUS_PLACEHOLDER
     else:
-        deal["sync_status"] = "not_found"
+        lead["sync_status"] = "not_found"
 
-    return deal
+    return lead
 
 
-async def _sync_deals_for_user(telegram_id: int, role: str, *, drop_missing: bool) -> (List[Dict], List[Dict]):
-    deals = await db.get_user_deals(telegram_id)
+async def _sync_leads_for_user(telegram_id: int, role: str, *, drop_missing: bool) -> (List[Dict], List[Dict]):
+    leads = await db.get_user_leads(telegram_id)
     synced: List[Dict] = []
     invalid: List[Dict] = []
 
-    for deal in deals:
-        synced_deal = await _sync_deal_with_bitrix(deal, role)
-        if synced_deal.get("sync_status") == "not_found":
-            invalid.append(synced_deal)
+    for lead in leads:
+        synced_lead = await _sync_lead_with_bitrix(lead, role)
+        if synced_lead.get("sync_status") == "not_found":
+            invalid.append(synced_lead)
         else:
-            synced.append(synced_deal)
+            synced.append(synced_lead)
 
     if drop_missing and invalid:
-        for deal in invalid:
-            await db.delete_deal(deal.get("deal_number"))
+        for lead in invalid:
+            await db.delete_lead(lead.get("lead_number"))
 
     return synced, invalid
 
 
 @router.message(F.text == "📝 Новая сделка")
-async def new_deal_start(message: Message, state: FSMContext):
-    """Start new deal creation"""
+async def new_lead_start(message: Message, state: FSMContext):
+    """Start new lead creation"""
     user = await db.get_user(message.from_user.id)
     role = user.get("role") if user else None
 
@@ -216,10 +259,10 @@ async def new_deal_start(message: Message, state: FSMContext):
         "📝 Создание новой сделки\n\nВведите ФИО клиента:",
         reply_markup=get_cancel_keyboard(),
     )
-    await state.set_state(DealCreationStates.waiting_for_client_name)
+    await state.set_state(LeadCreationStates.waiting_for_client_name)
 
 
-@router.message(DealCreationStates.waiting_for_client_name)
+@router.message(LeadCreationStates.waiting_for_client_name)
 async def client_name_entered(message: Message, state: FSMContext):
     """Handle client name input"""
     role = await _get_role_from_state(state)
@@ -238,10 +281,10 @@ async def client_name_entered(message: Message, state: FSMContext):
     await state.update_data(client_name=client_name)
 
     await message.answer("Введите номер телефона клиента:")
-    await state.set_state(DealCreationStates.waiting_for_client_phone)
+    await state.set_state(LeadCreationStates.waiting_for_client_phone)
 
 
-@router.message(DealCreationStates.waiting_for_client_phone)
+@router.message(LeadCreationStates.waiting_for_client_phone)
 async def client_phone_entered(message: Message, state: FSMContext):
     """Handle client phone input"""
     role = await _get_role_from_state(state)
@@ -269,10 +312,10 @@ async def client_phone_entered(message: Message, state: FSMContext):
     await message.answer(
         "Прикрепите файл проекта в формате PDF:\n(Отправьте PDF-файл или документ)"
     )
-    await state.set_state(DealCreationStates.waiting_for_project_file)
+    await state.set_state(LeadCreationStates.waiting_for_project_file)
 
 
-@router.message(DealCreationStates.waiting_for_project_file, F.document)
+@router.message(LeadCreationStates.waiting_for_project_file, F.document)
 async def project_file_uploaded(message: Message, state: FSMContext):
     """Handle project file upload"""
     document = message.document
@@ -287,10 +330,10 @@ async def project_file_uploaded(message: Message, state: FSMContext):
     await state.update_data(project_file_id=document.file_id, project_file_name=document.file_name)
 
     await message.answer("Добавьте комментарий к сделке:")
-    await state.set_state(DealCreationStates.waiting_for_comment)
+    await state.set_state(LeadCreationStates.waiting_for_comment)
 
 
-@router.message(DealCreationStates.waiting_for_project_file)
+@router.message(LeadCreationStates.waiting_for_project_file)
 async def project_file_invalid(message: Message, state: FSMContext):
     """Handle invalid project file"""
     role = await _get_role_from_state(state)
@@ -303,7 +346,7 @@ async def project_file_invalid(message: Message, state: FSMContext):
     await message.answer("Пожалуйста, отправьте PDF-файл проекта.")
 
 
-@router.message(DealCreationStates.waiting_for_comment)
+@router.message(LeadCreationStates.waiting_for_comment)
 async def comment_entered(message: Message, state: FSMContext):
     """Handle comment input"""
     role = await _get_role_from_state(state)
@@ -316,31 +359,38 @@ async def comment_entered(message: Message, state: FSMContext):
     comment = message.text.strip()
     await state.update_data(comment=comment)
 
+    await _send_confirmation(message, state)
+
+
+@router.callback_query(F.data == "confirm_yes", LeadCreationStates.confirming_lead)
+async def lead_confirmed(callback: CallbackQuery, state: FSMContext):
+    """Handle lead confirmation"""
     data = await state.get_data()
-
-    confirmation_text = (
-        "📋 Проверьте данные сделки:\n\n"
-        f"👤 Клиент: {data.get('client_name')}\n"
-        f"📱 Телефон: {data.get('client_phone')}\n"
-        f"📄 Файл: {data.get('project_file_name')}\n"
-        f"💬 Комментарий: {comment}\n\n"
-        "✅ Подтвердить создание сделки?"
-    )
-
-    await message.answer(confirmation_text, reply_markup=get_confirmation_keyboard())
-    await state.set_state(DealCreationStates.confirming_deal)
-
-
-@router.callback_query(F.data == "confirm_yes", DealCreationStates.confirming_deal)
-async def deal_confirmed(callback: CallbackQuery, state: FSMContext):
-    """Handle deal confirmation"""
+    await _set_default_source(state)
     data = await state.get_data()
     user = await db.get_user(callback.from_user.id)
     role = data.get("owner_role", user.get("role", "designer") if user else "designer")
 
+    project_file_id = data.get("project_file_id")
+    project_file_name = data.get("project_file_name")
+    project_file_bytes: Optional[bytes] = None
+
+    if project_file_id:
+        buffer = BytesIO()
+        try:
+            await callback.message.bot.download(project_file_id, destination=buffer)
+            project_file_bytes = buffer.getvalue()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Не удалось скачать файл проекта из Telegram, file_id=%s: %s",
+                project_file_id,
+                exc,
+            )
+            project_file_bytes = None
+
     await callback.message.edit_text("⏳ Создаю сделку в системе...")
 
-    deal_data = {
+    lead_data = {
         "designer_name": user.get("full_name"),
         "designer_bitrix_id": user.get("bitrix_id"),
         "designer_role_key": role,
@@ -348,38 +398,39 @@ async def deal_confirmed(callback: CallbackQuery, state: FSMContext):
         "crm_agent_name": user.get("full_name"),
         "client_full_name": data.get("client_name"),
         "client_phone": data.get("client_phone"),
-        "project_file_url": data.get("project_file_id"),  # В проде нужно загружать файл в Bitrix
-        "project_file_name": data.get("project_file_name"),
+        "project_file_id": project_file_id,
+        "project_file_name": project_file_name,
+        "project_file_bytes": project_file_bytes,
         "comment": data.get("comment"),
         "owner_role": role,
-        "stage_id": config.BITRIX_PARTNER_INITIAL_STAGE if role == "partner" else None,
+        "status_id": config.BITRIX_PARTNER_INITIAL_STAGE if role == "partner" else None,
+        "source_id": data.get("source_id"),
+        "source_description": data.get("source_name"),
+        "source_codes": data.get("source_codes"),
     }
 
-    if role == "partner":
-        bitrix_deal = await bitrix.create_partner_deal(deal_data)
-    else:
-        bitrix_deal = await bitrix.create_lead(deal_data)
+    bitrix_lead = await bitrix.create_lead(lead_data)
 
-    if bitrix_deal:
-        await db.add_deal({
-            "deal_number": bitrix_deal.get("number"),
-            "bitrix_deal_id": bitrix_deal.get("id"),
+    if bitrix_lead:
+        await db.add_lead({
+            "lead_number": bitrix_lead.get("number"),
+            "bitrix_lead_id": bitrix_lead.get("id"),
             "designer_telegram_id": callback.from_user.id,
             "client_full_name": data.get("client_name"),
             "client_phone": data.get("client_phone"),
             "project_file_id": data.get("project_file_id"),
             "project_file_name": data.get("project_file_name"),
             "comment": data.get("comment"),
-            "status": bitrix_deal.get("status", ""),
-            "entity_type": bitrix_deal.get("entity_type", "lead"),
+            "status": bitrix_lead.get("status", ""),
+            "entity_type": bitrix_lead.get("entity_type", "lead"),
             "owner_role": role,
         })
 
-        status_name = await bitrix.get_stage_name(bitrix_deal.get("status", ""), role=role)
+        status_name = await bitrix.get_stage_name(bitrix_lead.get("status", ""), role=role)
 
         await callback.message.answer(
             f"✅ Сделка успешно создана!\n\n"
-            f"📋 Номер сделки: {bitrix_deal.get('number')}\n"
+            f"📋 Номер сделки: {bitrix_lead.get('number')}\n"
             f"📊 Статус: {status_name}\n\n"
             "Вы можете отслеживать статус через меню 'Мои сделки' или 'Узнать статус'.",
             reply_markup=_menu_for_role(role),
@@ -395,9 +446,9 @@ async def deal_confirmed(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(F.data == "confirm_no", DealCreationStates.confirming_deal)
-async def deal_cancelled(callback: CallbackQuery, state: FSMContext):
-    """Handle deal cancellation"""
+@router.callback_query(F.data == "confirm_no", LeadCreationStates.confirming_lead)
+async def lead_cancelled(callback: CallbackQuery, state: FSMContext):
+    """Handle lead cancellation"""
     role = await _get_role_from_state(state)
 
     await callback.message.edit_text("❌ Создание сделки отменено.")
@@ -407,8 +458,8 @@ async def deal_cancelled(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(F.text == "📋 Мои сделки")
-async def my_deals(message: Message):
-    """Show user's deals with Bitrix validation"""
+async def my_leads(message: Message):
+    """Show user's leads with Bitrix validation"""
     user = await db.get_user(message.from_user.id)
     role = user.get("role") if user else None
 
@@ -416,9 +467,9 @@ async def my_deals(message: Message):
         await message.answer("❌ Эта функция доступна только для зарегистрированных дизайнеров и партнеров.")
         return
 
-    deals = await db.get_user_deals(message.from_user.id)
+    leads = await db.get_user_leads(message.from_user.id)
 
-    if not deals:
+    if not leads:
         await message.answer(
             "У вас пока нет активных сделок.\n\nСоздайте новую сделку через меню 'Новая сделка'!",
             reply_markup=_menu_for_role(role),
@@ -427,22 +478,22 @@ async def my_deals(message: Message):
 
     loading_msg = await message.answer("⏳ Синхронизирую сделки с Bitrix24...")
 
-    valid_deals, invalid_deals = await _sync_deals_for_user(
+    valid_leads, invalid_leads = await _sync_leads_for_user(
         message.from_user.id,
         role,
         drop_missing=True,
     )
 
-    if invalid_deals:
+    if invalid_leads:
         invalid_text_lines = [
             "⚠️ Некоторые сделки не найдены в Bitrix24 и были удалены из списка:",
             "",
         ]
-        for deal in invalid_deals:
+        for lead in invalid_leads:
             invalid_text_lines.extend([
-                f"📌 Сделка #{deal.get('deal_number')}",
-                f"👤 Клиент: {deal.get('client_full_name')}",
-                f"📅 Дата: {deal.get('created_date', '')[:10]}",
+                f"📌 Сделка #{lead.get('lead_number')}",
+                f"👤 Клиент: {lead.get('client_full_name')}",
+                f"📅 Дата: {lead.get('created_date', '')[:10]}",
                 "─" * 30,
             ])
         invalid_text_lines.append(
@@ -450,7 +501,7 @@ async def my_deals(message: Message):
         )
         await message.answer("\n".join(invalid_text_lines))
 
-    if not valid_deals:
+    if not valid_leads:
         await loading_msg.delete()
         await message.answer(
             "Список актуальных сделок пуст.\nСоздайте новую сделку через меню 'Новая сделка'!",
@@ -458,14 +509,14 @@ async def my_deals(message: Message):
         )
         return
 
-    text, keyboard = _render_deals_page(valid_deals, page=0, role=role)
+    text, keyboard = _render_leads_page(valid_leads, page=0, role=role)
     await loading_msg.delete()
     await message.answer(text, reply_markup=keyboard)
 
 
-@router.callback_query(F.data.startswith(f"{DEALS_CALLBACK_PREFIX}:"))
-async def paginate_deals(callback: CallbackQuery):
-    """Handle deals pagination callbacks"""
+@router.callback_query(F.data.startswith(f"{LEADS_CALLBACK_PREFIX}:"))
+async def paginate_leads(callback: CallbackQuery):
+    """Handle leads pagination callbacks"""
     parts = callback.data.split(":")
 
     if len(parts) != 3:
@@ -484,13 +535,13 @@ async def paginate_deals(callback: CallbackQuery):
         await callback.answer()
         return
 
-    valid_deals, _ = await _sync_deals_for_user(
+    valid_leads, _ = await _sync_leads_for_user(
         callback.from_user.id,
         role,
         drop_missing=False,
     )
 
-    if not valid_deals:
+    if not valid_leads:
         await callback.message.edit_text(
             "Список сделок пуст.",
             reply_markup=None,
@@ -498,14 +549,14 @@ async def paginate_deals(callback: CallbackQuery):
         await callback.answer()
         return
 
-    text, keyboard = _render_deals_page(valid_deals, page=page, role=role)
+    text, keyboard = _render_leads_page(valid_leads, page=page, role=role)
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
 
 @router.message(F.text == "🔍 Узнать статус")
 async def check_status_start(message: Message, state: FSMContext):
-    """Start deal status check"""
+    """Start lead status check"""
     user = await db.get_user(message.from_user.id)
     role = user.get("role") if user else None
 
@@ -519,12 +570,12 @@ async def check_status_start(message: Message, state: FSMContext):
         "🔍 Проверка статуса сделки\n\nВведите номер сделки:",
         reply_markup=get_cancel_keyboard(),
     )
-    await state.set_state(DealStatusStates.waiting_for_deal_number)
+    await state.set_state(LeadStatusStates.waiting_for_lead_number)
 
 
-@router.message(DealStatusStates.waiting_for_deal_number)
-async def deal_number_entered(message: Message, state: FSMContext):
-    """Handle deal number input"""
+@router.message(LeadStatusStates.waiting_for_lead_number)
+async def lead_number_entered(message: Message, state: FSMContext):
+    """Handle lead number input"""
     role = await _get_role_from_state(state)
 
     if message.text == CANCEL_TEXT:
@@ -532,43 +583,33 @@ async def deal_number_entered(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    deal_number = message.text.strip()
+    lead_number = message.text.strip()
 
-    deal = await db.get_deal_by_number(deal_number)
+    lead = await db.get_lead_by_number(lead_number)
 
-    if not deal:
+    if not lead:
         await message.answer(
-            f"❌ Сделка с номером {deal_number} не найдена.\nПроверьте номер и попробуйте снова."
+            f"❌ Сделка с номером {lead_number} не найдена.\nПроверьте номер и попробуйте снова."
         )
         return
 
-    if deal.get("designer_telegram_id") != message.from_user.id:
+    if lead.get("designer_telegram_id") != message.from_user.id:
         await message.answer("❌ Эта сделка вам не принадлежит.")
         await state.clear()
         return
 
-    deal_role = deal.get("owner_role", role)
-    entity_type = deal.get("entity_type", "lead")
-
-    if entity_type == "deal":
-        current_status = await bitrix.get_deal_status(deal.get("bitrix_deal_id"))
-    else:
-        current_status = await bitrix.get_lead_status(deal.get("bitrix_deal_id"))
+    lead_role = lead.get("owner_role", role)
+    current_status = await bitrix.get_lead_status(lead.get("bitrix_lead_id"))
 
     if current_status:
-        await db.update_deal_status(deal_number, current_status)
-
-        if _is_status_allowed(current_status, deal_role):
-            status_name = await bitrix.get_stage_name(current_status, role=deal_role)
-        else:
-            status_name = config.UNKNOWN_STATUS_PLACEHOLDER
-
+        await db.update_lead_status(lead_number, current_status)
+        status_name = await bitrix.get_stage_name(current_status, role=lead_role) or config.UNKNOWN_STATUS_PLACEHOLDER
         await message.answer(
-            f"📊 Статус сделки #{deal_number}\n\n"
-            f"👤 Клиент: {deal.get('client_full_name')}\n"
-            f"📱 Телефон: {deal.get('client_phone')}\n"
+            f"📊 Статус сделки #{lead_number}\n\n"
+            f"👤 Клиент: {lead.get('client_full_name')}\n"
+            f"📱 Телефон: {lead.get('client_phone')}\n"
             f"📊 Текущий статус: {status_name}\n"
-            f"📅 Дата создания: {deal.get('created_date', '')[:10]}",
+            f"📅 Дата создания: {lead.get('created_date', '')[:10]}",
             reply_markup=_menu_for_role(role),
         )
     else:

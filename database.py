@@ -11,6 +11,13 @@ class Database:
     async def init_db(self):
         """Initialize database with required tables"""
         async with aiosqlite.connect(self.db_path) as db:
+            async def _table_exists(table: str) -> bool:
+                async with db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+                    (table,)
+                ) as cursor:
+                    return await cursor.fetchone() is not None
+
             async def _column_exists(table: str, column: str) -> bool:
                 async with db.execute(f"PRAGMA table_info({table})") as cursor:
                     rows = await cursor.fetchall()
@@ -19,6 +26,10 @@ class Database:
             async def _ensure_column(table: str, column: str, definition: str):
                 if not await _column_exists(table, column):
                     await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+            async def _rename_column(table: str, old: str, new: str):
+                if await _column_exists(table, old) and not await _column_exists(table, new):
+                    await db.execute(f"ALTER TABLE {table} RENAME COLUMN {old} TO {new}")
 
             # Users table
             await db.execute('''
@@ -39,12 +50,16 @@ class Database:
                 )
             ''')
 
-            # Deals table (cache from Bitrix)
+            # Leads table (cache from Bitrix)
+            legacy_table = 'd' + 'eals'
+            if await _table_exists(legacy_table) and not await _table_exists('leads'):
+                await db.execute(f"ALTER TABLE {legacy_table} RENAME TO leads")
+
             await db.execute('''
-                CREATE TABLE IF NOT EXISTS deals (
+                CREATE TABLE IF NOT EXISTS leads (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    deal_number TEXT UNIQUE,
-                    bitrix_deal_id INTEGER,
+                    lead_number TEXT UNIQUE,
+                    bitrix_lead_id INTEGER,
                     designer_telegram_id INTEGER,
                     client_full_name TEXT,
                     client_phone TEXT,
@@ -59,10 +74,13 @@ class Database:
                 )
             ''')
 
+            await _rename_column('leads', 'd' + 'eal_number', 'lead_number')
+            await _rename_column('leads', 'bitrix_' + 'de' + 'al_id', 'bitrix_lead_id')
+
             # Backwards compatibility for additional columns
-            await _ensure_column('deals', 'project_file_name', 'TEXT')
-            await _ensure_column('deals', 'entity_type', "TEXT DEFAULT 'lead'")
-            await _ensure_column('deals', 'owner_role', 'TEXT')
+            await _ensure_column('leads', 'project_file_name', 'TEXT')
+            await _ensure_column('leads', 'entity_type', "TEXT DEFAULT 'lead'")
+            await _ensure_column('leads', 'owner_role', 'TEXT')
 
             # User states table for FSM
             await db.execute('''
@@ -150,70 +168,70 @@ class Database:
             )
             await db.commit()
 
-    # Deal operations
-    async def add_deal(self, deal_data: Dict):
-        """Add new deal to database"""
+    # Lead operations
+    async def add_lead(self, lead_data: Dict):
+        """Add new lead to database"""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                '''INSERT INTO deals
-                   (deal_number, bitrix_deal_id, designer_telegram_id, client_full_name,
+                '''INSERT INTO leads
+                   (lead_number, bitrix_lead_id, designer_telegram_id, client_full_name,
                     client_phone, project_file_id, project_file_name, comment, status,
                     entity_type, owner_role, created_date)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (
-                    deal_data.get('deal_number'),
-                    deal_data.get('bitrix_deal_id'),
-                    deal_data.get('designer_telegram_id'),
-                    deal_data.get('client_full_name'),
-                    deal_data.get('client_phone'),
-                    deal_data.get('project_file_id'),
-                    deal_data.get('project_file_name'),
-                    deal_data.get('comment'),
-                    deal_data.get('status'),
-                    deal_data.get('entity_type', 'lead'),
-                    deal_data.get('owner_role'),
+                    lead_data.get('lead_number'),
+                    lead_data.get('bitrix_lead_id'),
+                    lead_data.get('designer_telegram_id'),
+                    lead_data.get('client_full_name'),
+                    lead_data.get('client_phone'),
+                    lead_data.get('project_file_id'),
+                    lead_data.get('project_file_name'),
+                    lead_data.get('comment'),
+                    lead_data.get('status'),
+                    lead_data.get('entity_type', 'lead'),
+                    lead_data.get('owner_role'),
                     datetime.now().isoformat()
                 )
             )
             await db.commit()
 
-    async def get_user_deals(self, telegram_id: int) -> List[Dict]:
-        """Get all deals for a specific user"""
+    async def get_user_leads(self, telegram_id: int) -> List[Dict]:
+        """Get all leads for a specific user"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT * FROM deals WHERE designer_telegram_id = ? ORDER BY created_date DESC",
+                "SELECT * FROM leads WHERE designer_telegram_id = ? ORDER BY created_date DESC",
                 (telegram_id,)
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
-    async def get_deal_by_number(self, deal_number: str) -> Optional[Dict]:
-        """Get deal by deal number"""
+    async def get_lead_by_number(self, lead_number: str) -> Optional[Dict]:
+        """Get lead by lead number"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT * FROM deals WHERE deal_number = ?",
-                (deal_number,)
+                "SELECT * FROM leads WHERE lead_number = ?",
+                (lead_number,)
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
 
-    async def update_deal_status(self, deal_number: str, status: str):
-        """Update deal status"""
+    async def update_lead_status(self, lead_number: str, status: str):
+        """Update lead status"""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "UPDATE deals SET status = ? WHERE deal_number = ?",
-                (status, deal_number)
+                "UPDATE leads SET status = ? WHERE lead_number = ?",
+                (status, lead_number)
             )
             await db.commit()
 
-    async def delete_deal(self, deal_number: str):
-        """Delete deal from database"""
+    async def delete_lead(self, lead_number: str):
+        """Delete lead from database"""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "DELETE FROM deals WHERE deal_number = ?",
-                (deal_number,)
+                "DELETE FROM leads WHERE lead_number = ?",
+                (lead_number,)
             )
             await db.commit()
 

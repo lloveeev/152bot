@@ -135,7 +135,7 @@ https://t.me/your_bot?start=QR        - трафик из QR-кода
 ├── handlers/
 │   ├── __init__.py
 │   ├── registration.py        # Обработчики регистрации
-│   ├── deals.py               # Обработчики сделок
+│   ├── leads.py               # Обработчики лидов
 │   └── admin.py               # Административные обработчики
 ├── requirements.txt           # Зависимости
 ├── .env.example              # Пример конфигурации

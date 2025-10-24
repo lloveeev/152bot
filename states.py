@@ -12,18 +12,18 @@ class RegistrationStates(StatesGroup):
     confirming_data = State()
 
 
-class DealCreationStates(StatesGroup):
-    """States for deal creation flow"""
+class LeadCreationStates(StatesGroup):
+    """States for lead creation flow"""
     waiting_for_client_name = State()
     waiting_for_client_phone = State()
     waiting_for_project_file = State()
     waiting_for_comment = State()
-    confirming_deal = State()
+    confirming_lead = State()
 
 
-class DealStatusStates(StatesGroup):
-    """States for checking deal status"""
-    waiting_for_deal_number = State()
+class LeadStatusStates(StatesGroup):
+    """States for checking lead status"""
+    waiting_for_lead_number = State()
 
 
 class BroadcastStates(StatesGroup):
